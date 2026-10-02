@@ -1,14 +1,16 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
+	"net/mail"
+	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,10 +28,9 @@ import (
 // (cta_url + webview_presentation=full): o cliente preenche sem sair do app.
 //
 // Fluxo:
-//   POST /api/sessions/{sid}/messages/form  -> monta um token assinado com a
-//     definição do form (campos), manda uma mensagem interativa com botão webview
-//     apontando para /forms/{token} (rota PÚBLICA, sem API key — o celular do
-//     cliente não tem a chave).
+//   POST /api/sessions/{sid}/messages/form  -> persiste o formulário e manda uma
+//     mensagem interativa com botão webview apontando para /forms/{token}. A rota
+//     é pública porque o celular do cliente não tem a chave da API.
 //   GET  /forms/{token}          -> renderiza o HTML do formulário.
 //   POST /forms/{token}/submit   -> recebe o preenchimento: injeta como mensagem
 //     recebida (Chatwoot + webhook "message"), dispara o evento "form_response" e
@@ -45,56 +46,151 @@ type formField struct {
 	Required    bool     `json:"required"`
 }
 
-// formToken é o payload assinado embutido na URL do formulário.
-type formToken struct {
-	SID    string      `json:"sid"`
-	To     string      `json:"to"`   // JID canônico do destinatário
-	Chat   string      `json:"chat"` // JID do chat (=To em 1:1; grupo em grupo)
-	Push   string      `json:"push"` // nome de exibição (opcional)
-	Title  string      `json:"title"`
-	Intro  string      `json:"intro"`
-	Submit string      `json:"submit"`
-	Fields []formField `json:"fields"`
-	TS     int64       `json:"ts"`
+const (
+	defaultFormTTL        = 24 * time.Hour
+	minFormTTL            = 5 * time.Minute
+	maxFormTTL            = 7 * 24 * time.Hour
+	maxFormFields         = 30
+	maxFormRequestBytes   = 64 << 10
+	maxFormValueLength    = 512
+	maxFormTextAreaLength = 4096
+)
+
+var (
+	formFieldNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
+	formPhonePattern     = regexp.MustCompile(`^[0-9+(). -]{7,30}$`)
+)
+
+func normalizeFormTTL(seconds int) (time.Duration, error) {
+	if seconds == 0 {
+		return defaultFormTTL, nil
+	}
+	ttl := time.Duration(seconds) * time.Second
+	if ttl < minFormTTL || ttl > maxFormTTL {
+		return 0, fmt.Errorf("expiresInSeconds deve estar entre %d e %d", int(minFormTTL.Seconds()), int(maxFormTTL.Seconds()))
+	}
+	return ttl, nil
 }
 
-func formSigningKey() []byte {
-	k := os.Getenv("WACALLS_API_KEY")
-	if k == "" {
-		k = "wacalls-form"
+func normalizeFormFields(fields []formField) ([]formField, error) {
+	if len(fields) == 0 || len(fields) > maxFormFields {
+		return nil, fmt.Errorf("fields deve conter entre 1 e %d campos", maxFormFields)
 	}
-	return []byte(k)
+	seen := make(map[string]struct{}, len(fields))
+	out := make([]formField, len(fields))
+	for i, field := range fields {
+		field.Name = strings.TrimSpace(field.Name)
+		field.Label = strings.TrimSpace(field.Label)
+		field.Placeholder = strings.TrimSpace(field.Placeholder)
+		field.Type = strings.TrimSpace(field.Type)
+		if field.Type == "" {
+			field.Type = "text"
+		}
+		if !formFieldNamePattern.MatchString(field.Name) {
+			return nil, fmt.Errorf("nome de campo inválido: %q", field.Name)
+		}
+		if _, exists := seen[field.Name]; exists {
+			return nil, fmt.Errorf("campo duplicado: %q", field.Name)
+		}
+		seen[field.Name] = struct{}{}
+		if len(field.Label) > 120 || len(field.Placeholder) > 200 {
+			return nil, fmt.Errorf("texto do campo %q excede o limite", field.Name)
+		}
+		switch field.Type {
+		case "text", "email", "tel", "number", "date", "textarea":
+			field.Options = nil
+		case "select":
+			if len(field.Options) == 0 || len(field.Options) > 50 {
+				return nil, fmt.Errorf("campo select %q deve ter entre 1 e 50 opções", field.Name)
+			}
+			for optionIndex, option := range field.Options {
+				option = strings.TrimSpace(option)
+				if option == "" || len(option) > 120 {
+					return nil, fmt.Errorf("opção inválida no campo %q", field.Name)
+				}
+				field.Options[optionIndex] = option
+			}
+		default:
+			return nil, fmt.Errorf("tipo inválido no campo %q", field.Name)
+		}
+		out[i] = field
+	}
+	return out, nil
 }
 
-func encodeFormToken(t formToken) string {
-	raw, _ := json.Marshal(t)
-	payload := base64.RawURLEncoding.EncodeToString(raw)
-	mac := hmac.New(sha256.New, formSigningKey())
-	mac.Write([]byte(payload))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return payload + "." + sig
+func validateFormAnswers(fields []formField, values url.Values) (map[string]string, error) {
+	answers := make(map[string]string, len(fields))
+	for _, field := range fields {
+		value := strings.TrimSpace(values.Get(field.Name))
+		label := field.Label
+		if label == "" {
+			label = field.Name
+		}
+		if field.Required && value == "" {
+			return nil, fmt.Errorf("campo obrigatório: %s", label)
+		}
+		limit := maxFormValueLength
+		if field.Type == "textarea" {
+			limit = maxFormTextAreaLength
+		}
+		if len(value) > limit {
+			return nil, fmt.Errorf("campo %s excede o limite", label)
+		}
+		if value != "" {
+			switch field.Type {
+			case "email":
+				address, err := mail.ParseAddress(value)
+				if err != nil || address.Address != value {
+					return nil, fmt.Errorf("e-mail inválido no campo %s", label)
+				}
+			case "tel":
+				if !formPhonePattern.MatchString(value) {
+					return nil, fmt.Errorf("telefone inválido no campo %s", label)
+				}
+			case "number":
+				if _, err := strconv.ParseFloat(value, 64); err != nil {
+					return nil, fmt.Errorf("número inválido no campo %s", label)
+				}
+			case "date":
+				if _, err := time.Parse("2006-01-02", value); err != nil {
+					return nil, fmt.Errorf("data inválida no campo %s", label)
+				}
+			case "select":
+				valid := false
+				for _, option := range field.Options {
+					if value == option {
+						valid = true
+						break
+					}
+				}
+				if !valid {
+					return nil, fmt.Errorf("opção inválida no campo %s", label)
+				}
+			}
+		}
+		answers[field.Name] = value
+	}
+	return answers, nil
 }
 
-func decodeFormToken(tok string) (formToken, bool) {
-	var t formToken
-	parts := strings.SplitN(tok, ".", 2)
-	if len(parts) != 2 {
-		return t, false
+func setFormSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+func writeFormAccessError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errFormExpired):
+		http.Error(w, "link expirado", http.StatusGone)
+	case errors.Is(err, errFormUsed):
+		http.Error(w, "formulário já respondido", http.StatusConflict)
+	case errors.Is(err, errFormNotFound):
+		http.Error(w, "link inválido", http.StatusNotFound)
+	default:
+		http.Error(w, "erro ao abrir formulário", http.StatusInternalServerError)
 	}
-	mac := hmac.New(sha256.New, formSigningKey())
-	mac.Write([]byte(parts[0]))
-	want := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(want), []byte(parts[1])) {
-		return t, false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return t, false
-	}
-	if err := json.Unmarshal(raw, &t); err != nil {
-		return t, false
-	}
-	return t, true
 }
 
 // publicBaseURL deriva a URL pública: env WACALLS_PUBLIC_BASE_URL ou o Host da
@@ -114,23 +210,35 @@ func publicBaseURL(r *http.Request) string {
 
 // POST /api/sessions/{sid}/messages/form
 // {to, title?, body?, footer?, submitText?, buttonText?,
-//  fields:[{name,label,type,options[],placeholder,required}]}
+//
+//	fields:[{name,label,type,options[],placeholder,required}]}
 func (s *server) handleSendForm(w http.ResponseWriter, r *http.Request) {
 	sess := s.pairedSession(w, r.PathValue("sid"))
 	if sess == nil {
 		return
 	}
 	var b struct {
-		To         string      `json:"to"`
-		Title      string      `json:"title"`
-		Body       string      `json:"body"`
-		Footer     string      `json:"footer"`
-		SubmitText string      `json:"submitText"`
-		ButtonText string      `json:"buttonText"`
-		Fields     []formField `json:"fields"`
+		To               string      `json:"to"`
+		Title            string      `json:"title"`
+		Body             string      `json:"body"`
+		Footer           string      `json:"footer"`
+		SubmitText       string      `json:"submitText"`
+		ButtonText       string      `json:"buttonText"`
+		ExpiresInSeconds int         `json:"expiresInSeconds"`
+		Fields           []formField `json:"fields"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil || strings.TrimSpace(b.To) == "" || len(b.Fields) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to e fields obrigatórios"})
+		return
+	}
+	fields, err := normalizeFormFields(b.Fields)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ttl, err := normalizeFormTTL(b.ExpiresInSeconds)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	jid, err := resolveRecipient(b.To)
@@ -147,12 +255,27 @@ func (s *server) handleSendForm(w http.ResponseWriter, r *http.Request) {
 	if b.ButtonText == "" {
 		b.ButtonText = "Abrir formulário"
 	}
-	tok := encodeFormToken(formToken{
-		SID: sess.id, To: jid.String(), Chat: jid.String(),
+	token, tokenHash, err := newCapabilityToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "não foi possível criar o formulário"})
+		return
+	}
+	formID, err := newPublicID("form_")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "não foi possível criar o formulário"})
+		return
+	}
+	form := formInstance{
+		ID: formID, SID: sess.id, To: jid.String(), Chat: jid.String(),
 		Title: b.Title, Intro: b.Body, Submit: b.SubmitText,
-		Fields: b.Fields, TS: time.Now().Unix(),
-	})
-	formURL := publicBaseURL(r) + "/forms/" + tok
+		Fields: fields, ExpiresAt: time.Now().UTC().Add(ttl),
+	}
+	if err := s.sessions.store.createForm(r.Context(), tokenHash, form); err != nil {
+		s.log.Error("form create failed", "err", err, "session", sess.id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "não foi possível criar o formulário"})
+		return
+	}
+	formURL := publicBaseURL(r) + "/forms/" + token
 
 	// Botão webview (cta_url + webview_presentation=full) — abre a webview no app.
 	name, params := nativeFlowButton("webview", b.ButtonText, formURL, "", "", "", 0)
@@ -171,44 +294,74 @@ func (s *server) handleSendForm(w http.ResponseWriter, r *http.Request) {
 		},
 		MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: newMessageSecret()},
 	}
-	s.sendNativeFlow(sess, w, r, jid, msg)
+	s.sendNativeFlowWithExtras(sess, w, r, jid, msg, map[string]any{
+		"form_id":    form.ID,
+		"expires_at": form.ExpiresAt.Format(time.RFC3339),
+	})
 }
 
 // GET /forms/{token} — renderiza o HTML (rota pública).
 func (s *server) handleFormPage(w http.ResponseWriter, r *http.Request) {
-	t, ok := decodeFormToken(r.PathValue("token"))
-	if !ok {
-		http.Error(w, "link inválido ou expirado", http.StatusBadRequest)
+	setFormSecurityHeaders(w)
+	token := r.PathValue("token")
+	if !validCapabilityToken(token) {
+		writeFormAccessError(w, errFormNotFound)
+		return
+	}
+	form, err := s.sessions.store.getActiveForm(r.Context(), hashCapabilityToken(token), time.Now().UTC())
+	if err != nil {
+		writeFormAccessError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, renderFormHTML(t, "/forms/"+r.PathValue("token")+"/submit"))
+	fmt.Fprint(w, renderFormHTML(form, "/forms/"+token+"/submit"))
 }
 
 // POST /forms/{token}/submit — recebe o preenchimento (rota pública).
 func (s *server) handleFormSubmit(w http.ResponseWriter, r *http.Request) {
-	t, ok := decodeFormToken(r.PathValue("token"))
-	if !ok {
-		http.Error(w, "link inválido ou expirado", http.StatusBadRequest)
+	setFormSecurityHeaders(w)
+	token := r.PathValue("token")
+	if !validCapabilityToken(token) {
+		writeFormAccessError(w, errFormNotFound)
 		return
 	}
-	sess, ok := s.sessions.Get(t.SID)
+	tokenHash := hashCapabilityToken(token)
+	form, err := s.sessions.store.getActiveForm(r.Context(), tokenHash, time.Now().UTC())
+	if err != nil {
+		writeFormAccessError(w, err)
+		return
+	}
+	sess, ok := s.sessions.Get(form.SID)
 	if !ok {
 		http.Error(w, "sessão indisponível", http.StatusGone)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxFormRequestBytes)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "erro ao ler formulário", http.StatusBadRequest)
 		return
 	}
+	answers, err := validateFormAnswers(form.Fields, r.PostForm)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	chat, err := resolveRecipient(form.Chat)
+	if err != nil {
+		http.Error(w, "destinatário inválido", http.StatusInternalServerError)
+		return
+	}
+	submittedAt := time.Now().UTC()
+	form, submissionID, err := s.sessions.store.consumeForm(r.Context(), tokenHash, submittedAt)
+	if err != nil {
+		writeFormAccessError(w, err)
+		return
+	}
 
-	// Coleta ordenada + monta o resumo (texto) e o mapa de respostas.
-	answers := make(map[string]string, len(t.Fields))
 	var sb strings.Builder
-	sb.WriteString("📋 *" + t.Title + "*\n")
-	for _, f := range t.Fields {
-		v := strings.TrimSpace(r.PostFormValue(f.Name))
-		answers[f.Name] = v
+	sb.WriteString("📋 *" + form.Title + "*\n")
+	for _, f := range form.Fields {
+		v := answers[f.Name]
 		label := f.Label
 		if label == "" {
 			label = f.Name
@@ -217,34 +370,32 @@ func (s *server) handleFormSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	summary := sb.String()
 
-	chat, err := resolveRecipient(t.Chat)
-	if err == nil {
-		// 1) injeta como mensagem RECEBIDA -> cai no Chatwoot e no webhook "message".
-		synthetic := &events.Message{
-			Info: types.MessageInfo{
-				MessageSource: types.MessageSource{Chat: chat, Sender: chat},
-				ID:            sess.client.GenerateMessageID(),
-				Timestamp:     time.Now(),
-				PushName:      t.Push,
-			},
-			Message: &waE2E.Message{Conversation: proto.String(summary)},
-		}
-		sess.storeMessageEvent(synthetic)
-		sess.dispatchWebhook("message", sess.messagePayload(synthetic))
-		go sess.chatwootPushIncoming(synthetic)
+	synthetic := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: chat, Sender: chat},
+			ID:            sess.client.GenerateMessageID(),
+			Timestamp:     submittedAt,
+			PushName:      form.Push,
+		},
+		Message: &waE2E.Message{Conversation: proto.String(summary)},
 	}
-	// 2) evento dedicado com as respostas estruturadas.
+	sess.storeMessageEvent(synthetic)
+	sess.dispatchWebhook("message", sess.messagePayload(synthetic))
+	go sess.chatwootPushIncoming(synthetic)
 	sess.dispatchWebhook("form_response", map[string]any{
-		"title":   t.Title,
-		"from":    t.To,
-		"answers": answers,
+		"form_id":       form.ID,
+		"submission_id": submissionID,
+		"submitted_at":  submittedAt.Format(time.RFC3339Nano),
+		"title":         form.Title,
+		"from":          form.To,
+		"answers":       answers,
 	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, formThanksHTML(t.Title))
+	fmt.Fprint(w, formThanksHTML(form.Title))
 }
 
-func renderFormHTML(t formToken, action string) string {
+func renderFormHTML(t formInstance, action string) string {
 	var fields strings.Builder
 	for _, f := range t.Fields {
 		req := ""

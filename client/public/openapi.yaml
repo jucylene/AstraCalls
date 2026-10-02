@@ -2709,7 +2709,10 @@ paths:
         `form_response` com os dados estruturados. Alternativa ao WhatsApp Flows
         nativo (que exige conta oficial/WABA e NÃO funciona em número não-oficial).
         As rotas `GET /forms/{token}` e `POST /forms/{token}/submit` são públicas
-        (o token assinado é a capability) e não exigem API key.
+        e não exigem API key. O token é uma capability aleatória, opaca, de uso
+        único e armazenada somente como hash. O formulário expira em 24 horas por
+        padrão, com validade configurável entre 5 minutos e 7 dias. A resposta de
+        envio inclui `form_id` e `expires_at` para correlação com o webhook.
       parameters:
         - { $ref: "#/components/parameters/Sid" }
         - { $ref: "#/components/parameters/ClientId" }
@@ -2727,6 +2730,7 @@ paths:
                 footer: { type: string, example: "AstraCalls" }
                 buttonText: { type: string, example: "Abrir formulário", description: "Texto do botão que abre a webview" }
                 submitText: { type: string, example: "Enviar cadastro", description: "Texto do botão de envio dentro do form" }
+                expiresInSeconds: { type: integer, minimum: 300, maximum: 604800, default: 86400, description: "Validade do link em segundos" }
                 fields:
                   type: array
                   description: "Campos do formulário, na ordem em que aparecem."

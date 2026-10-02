@@ -122,6 +122,26 @@ func newSessionStore(ctx context.Context, db *sql.DB) (*sessionStore, error) {
 	}
 	_, _ = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS chatwoot_outbox_due ON chatwoot_outbox (dead, next_at)`)
 
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS form_instances (
+		id            TEXT NOT NULL UNIQUE,
+		token_hash    TEXT PRIMARY KEY,
+		session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		to_jid        TEXT NOT NULL,
+		chat_jid      TEXT NOT NULL,
+		push_name     TEXT,
+		title         TEXT NOT NULL,
+		intro         TEXT,
+		submit_label  TEXT NOT NULL,
+		fields        JSONB NOT NULL,
+		expires_at    TIMESTAMPTZ NOT NULL,
+		used_at       TIMESTAMPTZ,
+		submission_id TEXT UNIQUE,
+		created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil {
+		return nil, err
+	}
+	_, _ = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS form_instances_expiry ON form_instances (expires_at) WHERE used_at IS NULL`)
+
 	return &sessionStore{db: db}, nil
 }
 

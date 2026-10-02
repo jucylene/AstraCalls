@@ -48,6 +48,10 @@ func bizNativeFlowNode() waBinary.Node {
 // sendNativeFlow envia a mensagem interativa com o stanza <biz> anexado + resolução
 // de LID (9º dígito) + id idempotente, e escreve a resposta HTTP.
 func (s *server) sendNativeFlow(sess *Session, w http.ResponseWriter, r *http.Request, jid types.JID, msg *waE2E.Message) {
+	s.sendNativeFlowWithExtras(sess, w, r, jid, msg, nil)
+}
+
+func (s *server) sendNativeFlowWithExtras(sess *Session, w http.ResponseWriter, r *http.Request, jid types.JID, msg *waE2E.Message, extras map[string]any) {
 	nodes := []waBinary.Node{bizNativeFlowNode()}
 	extra := whatsmeow.SendRequestExtra{AdditionalNodes: &nodes}
 	if id := messageIDFromRequest(r); id != "" {
@@ -59,7 +63,11 @@ func (s *server) sendNativeFlow(sess *Session, w http.ResponseWriter, r *http.Re
 		return
 	}
 	sess.recordOutgoing(jid, resp.ID, resp.Timestamp.UnixMilli(), msg)
-	writeJSON(w, http.StatusOK, map[string]any{"id": resp.ID, "to": jid.String(), "timestamp": resp.Timestamp.UnixMilli()})
+	response := map[string]any{"id": resp.ID, "to": jid.String(), "timestamp": resp.Timestamp.UnixMilli()}
+	for key, value := range extras {
+		response[key] = value
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // POST /api/sessions/{sid}/messages/buttons {to, text, footer?, buttons:[{id,text}]}
