@@ -21,6 +21,8 @@ jobs:
       CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -37,8 +39,14 @@ jobs:
         run: go vet ./...
 
       - name: Check formatting
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
-          unformatted="$(gofmt -l .)"
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$GITHUB_SHA" -- '*.go')
+          if [ "${#files[@]}" -eq 0 ]; then
+            exit 0
+          fi
+          unformatted="$(gofmt -l "${files[@]}")"
           if [ -n "$unformatted" ]; then
             echo "::error::The following files are not gofmt'd:"
             echo "$unformatted"

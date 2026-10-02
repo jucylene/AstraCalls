@@ -16,7 +16,7 @@ O build multi-arch é feito **na CI**, com build **nativo por arquitetura** (sem
 QEMU):
 
 - **amd64** → runner x86 do GitHub (`ubuntu-latest`)
-- **arm64** → runner ARM **efêmero** do Ubicloud (`ubicloud-standard-8-arm`)
+- **arm64** → runner ARM nativo do GitHub (`ubuntu-24.04-arm`)
 
 Cada job publica por **digest**; um job `merge` monta o **manifest list** nas
 tags finais. Workflow: [`.github/workflows/docker-multiarch.yml`](.github/workflows/docker-multiarch.yml).
@@ -32,11 +32,9 @@ tags finais. Workflow: [`.github/workflows/docker-multiarch.yml`](.github/workfl
 Ou seja: **para gerar imagem nova, basta dar push** (ou criar a tag de versão).
 Não é necessário — nem recomendado — buildar imagem na VPS.
 
-### Pré-requisitos (configurar uma vez)
+### Pré-requisitos
 
-- Repositório conectado ao **Ubicloud** (GitHub Actions runners), para o label
-  `ubicloud-standard-8-arm` resolver numa VM ARM efêmera.
-- Secrets do repositório: `DOCKERHUB_USERNAME` e `DOCKERHUB_TOKEN`.
+- Permissão `packages: write` no workflow para publicar no GHCR.
 - O checkout usa `submodules: recursive` (o `opus_mlow` é submódulo).
 
 ### Por que não buildar na VPS
@@ -51,7 +49,7 @@ antes e depois, e monte o manifesto com `docker buildx imagetools create`.
 
 ```bash
 docker service update --with-registry-auth \
-  --image astraonline/astracalls:develop wacalls_wacalls
+  --image ghcr.io/jucylene/astracalls:main astracalls_wacalls
 ```
 
 Num nó amd64 o manifesto resolve automaticamente para o sub-manifesto amd64.
