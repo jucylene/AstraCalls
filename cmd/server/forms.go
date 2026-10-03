@@ -40,7 +40,7 @@ import (
 type formField struct {
 	Name        string   `json:"name"`
 	Label       string   `json:"label"`
-	Type        string   `json:"type"`    // text|email|tel|number|textarea|select|date
+	Type        string   `json:"type"`    // text|email|tel|number|textarea|select|date|checkbox
 	Options     []string `json:"options"` // para select
 	Placeholder string   `json:"placeholder"`
 	Required    bool     `json:"required"`
@@ -97,7 +97,7 @@ func normalizeFormFields(fields []formField) ([]formField, error) {
 			return nil, fmt.Errorf("texto do campo %q excede o limite", field.Name)
 		}
 		switch field.Type {
-		case "text", "email", "tel", "number", "date", "textarea":
+		case "text", "email", "tel", "number", "date", "textarea", "checkbox":
 			field.Options = nil
 		case "select":
 			if len(field.Options) == 0 || len(field.Options) > 50 {
@@ -165,6 +165,10 @@ func validateFormAnswers(fields []formField, values url.Values) (map[string]stri
 				}
 				if !valid {
 					return nil, fmt.Errorf("opção inválida no campo %s", label)
+				}
+			case "checkbox":
+				if value != "true" {
+					return nil, fmt.Errorf("confirmação inválida no campo %s", label)
 				}
 			}
 		}
@@ -419,6 +423,8 @@ func renderFormHTML(t formInstance, action string) string {
 				fields.WriteString(`<option value="` + oe + `">` + oe + `</option>`)
 			}
 			fields.WriteString(`</select>`)
+		case "checkbox":
+			fields.WriteString(`<input type="checkbox" name="` + name + `" value="true"` + req + `>`)
 		default:
 			typ := f.Type
 			switch typ {
@@ -441,6 +447,7 @@ p.intro{color:#5a6b76;margin:0 0 20px}
 form{display:flex;flex-direction:column;gap:16px}
 label{display:flex;flex-direction:column;gap:6px;font-weight:600;font-size:14px;color:var(--navy)}
 input,select,textarea{font:inherit;font-weight:400;padding:12px 14px;border:1px solid #cdd8df;border-radius:12px;background:#fff;color:#1c2a33}
+input[type=checkbox]{width:22px;height:22px;padding:0}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(137,207,243,.35)}
 .req{color:#e0484d}
 button{margin-top:8px;padding:14px;border:0;border-radius:12px;background:var(--navy);color:#fff;font-size:16px;font-weight:700;cursor:pointer}

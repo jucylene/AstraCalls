@@ -62,11 +62,13 @@ func TestValidateFormAnswers(t *testing.T) {
 		{Name: "email", Label: "E-mail", Type: "email", Required: true},
 		{Name: "phone", Label: "Telefone", Type: "tel", Required: true},
 		{Name: "course", Label: "Curso", Type: "select", Options: []string{"IA", "Vendas"}, Required: true},
+		{Name: "consent", Label: "Consentimento", Type: "checkbox", Required: true},
 	}
 	values := url.Values{
-		"email":  {"aluna@example.com"},
-		"phone":  {"+55 (21) 99999-9999"},
-		"course": {"IA"},
+		"email":   {"aluna@example.com"},
+		"phone":   {"+55 (21) 99999-9999"},
+		"course":  {"IA"},
+		"consent": {"true"},
 	}
 	answers, err := validateFormAnswers(fields, values)
 	if err != nil {
@@ -81,6 +83,11 @@ func TestValidateFormAnswers(t *testing.T) {
 		t.Fatal("unknown select option should fail")
 	}
 	values.Set("course", "IA")
+	values.Set("consent", "false")
+	if _, err := validateFormAnswers(fields, values); err == nil {
+		t.Fatal("invalid checkbox value should fail")
+	}
+	values.Set("consent", "true")
 	values.Del("email")
 	if _, err := validateFormAnswers(fields, values); err == nil {
 		t.Fatal("missing required field should fail")

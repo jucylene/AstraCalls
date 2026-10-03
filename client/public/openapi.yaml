@@ -2742,7 +2742,7 @@ paths:
                       label: { type: string, example: "E-mail" }
                       type:
                         type: string
-                        enum: [text, email, tel, number, date, textarea, select]
+                        enum: [text, email, tel, number, date, textarea, select, checkbox]
                         default: text
                       options:
                         type: array
