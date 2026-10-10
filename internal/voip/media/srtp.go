@@ -60,6 +60,19 @@ func NewSrtpContext(keying core.SrtpKeyingMaterial, authTagLen int) (*SrtpContex
 	}, nil
 }
 
+// WithKeying devolve um contexto NOVO com as chaves de sessão derivadas de keying mas
+// preservando o estado de ROC/sequência deste — rotação de chave (epoch de grupo) sem
+// quebrar a continuidade do stream. O contexto antigo não é alterado (sem data race
+// com um Unprotect/Protect em andamento).
+func (c *SrtpContext) WithKeying(keying core.SrtpKeyingMaterial) (*SrtpContext, error) {
+	n, err := NewSrtpContext(keying, c.authTagLen)
+	if err != nil {
+		return nil, err
+	}
+	n.roc, n.lastSeq, n.initialized = c.roc, c.lastSeq, c.initialized
+	return n, nil
+}
+
 func (c *SrtpContext) SetAuthKeying(keying core.SrtpKeyingMaterial) error {
 	ak, err := deriveSrtpKey(keying.MasterKey, keying.MasterSalt, core.SRTPLabelAuth, 20)
 	if err != nil {
@@ -189,11 +202,28 @@ func (s *SrtpSession) Protect(packet *RtpPacket) ([]byte, error) { return s.send
 
 func (s *SrtpSession) Unprotect(data []byte) (*RtpPacket, error) { return s.recvCtx.Unprotect(data) }
 
+// WithKeying devolve uma sessão NOVA rechaveada (envio e recepção) preservando o
+// estado de ROC dos dois lados. Ver SrtpContext.WithKeying.
+func (s *SrtpSession) WithKeying(sendKey, recvKey core.SrtpKeyingMaterial) (*SrtpSession, error) {
+	sc, err := s.sendCtx.WithKeying(sendKey)
+	if err != nil {
+		return nil, err
+	}
+	rc, err := s.recvCtx.WithKeying(recvKey)
+	if err != nil {
+		return nil, err
+	}
+	return &SrtpSession{sendCtx: sc, recvCtx: rc}, nil
+}
+
 func (s *SrtpSession) SetSendAuthKeying(keying core.SrtpKeyingMaterial) error {
 	return s.sendCtx.SetAuthKeying(keying)
 }
 
 func deriveSrtpKey(masterKey, masterSalt []byte, label byte, length int) ([]byte, error) {
+	if len(masterSalt) < 14 {
+		return nil, fmt.Errorf("srtp: master salt curto demais (%d bytes, precisa 14)", len(masterSalt))
+	}
 	iv := make([]byte, 16)
 	copy(iv, masterSalt[:14])
 	iv[7] ^= label

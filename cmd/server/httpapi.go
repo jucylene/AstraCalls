@@ -28,6 +28,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionCreate)
 	mux.HandleFunc("GET /api/sessions/{sid}/calls", s.handleSessionCalls)
+	mux.HandleFunc("GET /api/sessions/{sid}/restriction-status", s.handleRestrictionStatus)
 	mux.HandleFunc("DELETE /api/sessions/{sid}", s.handleSessionDelete)
 	mux.HandleFunc("POST /api/sessions/{sid}/logout", s.handleSessionLogout)
 	mux.HandleFunc("POST /api/sessions/{sid}/pair", s.handleSessionPair)
@@ -35,6 +36,11 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/pair-passkey", s.handlePairPasskey)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls", s.handleStartCall)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/fake", s.handleFakeCall)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/group", s.handleStartGroupCall)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/group/end", s.handleEndGroupCall)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/group/ws", s.handleGroupWSBridge)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/group/video-ws", s.handleGroupVideoWS)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/group/roster", s.handleGroupRoster)
 
 	// Gateway SIP (modelo Wavoip): status global e credenciais por sessão.
 	mux.HandleFunc("GET /api/sip/status", s.handleSIPStatus)
@@ -52,6 +58,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/video/{action}", s.handleCallVideo)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/hold", s.handleHold)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/resume", s.handleResume)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/mute", s.handleCallMute)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/hand", s.handleCallHand)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/transfer", s.handleTransfer)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/pickup", s.handlePickup)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}", s.handleEndCall)
@@ -413,6 +421,8 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		// logo e `commit` (SHA) no tooltip.
 		"version": version,
 		"commit":  commit,
+		// Chamada em grupo (experimental) habilitada nesta instância.
+		"groupCalls": groupCallsEnabled(),
 	})
 }
 
@@ -528,6 +538,51 @@ func (s *server) handleEndCall(w http.ResponseWriter, r *http.Request) {
 // handleCallVideo controla a negociação de vídeo mid-call numa chamada ativa.
 // action ∈ {request, accept, reject, stop}: pedir upgrade p/ vídeo, aceitar/recusar
 // um pedido recebido, ou desligar o vídeo (downgrade p/ áudio).
+// handleCallMute anuncia ao peer o estado do nosso microfone (<mute_v2>). Body:
+// {"muted": true|false}. Portado do zapo (indicador de mic-off no outro lado).
+func (s *server) handleCallMute(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	ac, ok := sess.reg.get(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var b struct {
+		Muted bool `json:"muted"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	if err := ac.cm.AnnounceMute(r.Context(), b.Muted); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "muted": b.Muted})
+}
+
+// handleCallHand anuncia ao peer a nossa mão levantada/baixada. Body: {"raised": bool}.
+func (s *server) handleCallHand(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	ac, ok := sess.reg.get(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var b struct {
+		Raised bool `json:"raised"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	if err := ac.cm.SetHandRaised(r.Context(), b.Raised); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "raised": b.Raised})
+}
+
 func (s *server) handleCallVideo(w http.ResponseWriter, r *http.Request) {
 	sess := s.sessionByID(w, r.PathValue("sid"))
 	if sess == nil {

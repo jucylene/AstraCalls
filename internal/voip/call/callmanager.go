@@ -25,6 +25,7 @@ type CallManager struct {
 	srtpSession *media.SrtpSession
 	codec       media.Codec
 	relay       RelayTransport
+	mediaClock  *media.MediaClock // relógio único da call (áudio+vídeo no mesmo eixo)
 
 	selfSsrc      uint32
 	peerSsrcs     []uint32
@@ -65,6 +66,8 @@ type CallManager struct {
 
 	OnVideoUpgradeRequest func(*CallInfo) // o peer pediu um upgrade p/ vídeo
 	OnVideoStateChanged   func(*CallInfo) // qualquer mudança no estado de vídeo
+	OnPeerMute            func(*CallInfo) // o peer mutou/abriu o microfone (<mute_v2>)
+	OnHandRaise           func(*CallInfo) // o peer levantou/baixou a mão (raise_hand)
 }
 
 func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
@@ -87,6 +90,7 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 			m.OnPeerVideo(au)
 		}
 	}
+	m.video.OnOrientation = func(o int) { m.notePeerVideoOrientation(o) }
 	return m
 }
 
@@ -164,7 +168,7 @@ func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid type
 
 	selfJid := creator.String()
 	m.selfSsrc = media.GenerateSecureSsrc(callID, selfJid, 0)
-	m.rtpSession = media.NewWhatsAppOpusSession(m.selfSsrc)
+	m.rtpSession = m.newAudioRtpLocked(m.selfSsrc)
 	m.peerSsrcs = []uint32{media.GenerateSecureSsrc(callID, resolved.String(), 0)}
 	m.initCodec()
 	m.mu.Unlock()

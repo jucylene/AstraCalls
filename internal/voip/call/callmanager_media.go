@@ -39,6 +39,12 @@ func (m *CallManager) initCodec() {
 		return
 	}
 	m.codec = codec
+	// Diagnóstico opt-in: loga quando o payload MLow vem embrulhado (container 0x92 de
+	// vídeo+DTX, ou RED) — confirma em produção qual camada está chegando.
+	if mediaDebugEnabled && media.MLowDebug == nil {
+		log := m.log
+		media.MLowDebug = func(msg string, kv ...any) { log.Info("mlow depacket", append([]any{"ev", msg}, kv...)...) }
+	}
 }
 
 func (m *CallManager) FeedCapturedPCM(data []float32) {
@@ -56,6 +62,19 @@ func (m *CallManager) FeedCapturedPCM(data []float32) {
 func (m *CallManager) sendOpusFrameLocked(opus []byte) {
 	if m.rtpSession == nil || m.srtpSession == nil {
 		return
+	}
+	if !m.firstPacketSent {
+		// Ancora o relógio de mídia no 1º pacote de áudio (início REAL da mídia): o
+		// áudio começa em ts=0 aqui e o vídeo (1º frame) fica ancorado no MESMO instante.
+		// Sem isto, o relógio nascia no offer e o vídeo ficava adiantado do áudio pelo
+		// tempo de toque -> o receptor segurava o vídeo (congelava). Mesmo objeto do
+		// pipeline (SetClock), então o Reset vale pro vídeo também.
+		if m.mediaClock == nil {
+			m.mediaClock = media.NewMediaClock()
+		} else {
+			m.mediaClock.Reset()
+		}
+		m.rtpSession.SetTimestamp(0)
 	}
 	marker := !m.firstPacketSent
 	pkt := m.rtpSession.CreatePacketWithDuration(opus, m.codec.FrameSize(), marker)

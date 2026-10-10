@@ -36,6 +36,7 @@ type Pipeline struct {
 	rtp      *media.RtpSession
 	srtp     *media.SrtpSession
 	selfSsrc uint32
+	clock    *media.MediaClock // relógio de mídia da call (semeia o ts do vídeo no 1º frame)
 	depack   *transport.H264Depacketizer
 	frameBuf []byte
 	lastAUAt time.Time
@@ -45,14 +46,57 @@ type Pipeline struct {
 	transportSeq     uint16 // sequência transport (por pacote)
 	keyframeRequired bool   // o primeiro frame enviado precisa ser IDR
 
+	stats media.RtcpSenderStats // contadores de envio (p/ Sender Report SRTCP)
+
+	lastOrientation int // última orientação (0..3) vista na extensão RTP do peer; -1 = nenhuma
+
 	OnFrame func(au []byte)
+	// OnOrientation é chamado quando a ORIENTAÇÃO da câmera do peer muda (quartos de
+	// volta horários, 0..3), lida da extensão de vídeo do WhatsApp (MediaFrameInfo,
+	// bits baixos = CVO). Permite o painel girar o vídeo sozinho.
+	OnOrientation func(orientation int)
+}
+
+// parseVideoOrientation lê a orientação (CVO, 2 bits baixos do MediaFrameInfo, id 3)
+// da extensão 0xDEBE de um pacote de vídeo recebido.
+func parseVideoOrientation(h *media.RtpHeader) (int, bool) {
+	if h == nil || !h.Extension || h.ExtensionProfile != videoExtProfile {
+		return 0, false
+	}
+	ext := h.ExtensionData
+	for off := 0; off < len(ext); {
+		hdr := ext[off]
+		off++
+		if hdr == 0 {
+			continue // padding
+		}
+		id := hdr >> 4
+		l := int(hdr&0x0f) + 1
+		if id == 15 || off+l > len(ext) {
+			return 0, false
+		}
+		if id == 3 {
+			return int(ext[off] & 0x03), true
+		}
+		off += l
+	}
+	return 0, false
 }
 
 func New(log *slog.Logger, relay Relay) *Pipeline {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Pipeline{log: log, relay: relay}
+	return &Pipeline{log: log, relay: relay, lastOrientation: -1}
+}
+
+// SetClock liga o relógio de mídia da call ao pipeline: o 1º frame de vídeo é semeado
+// com o timestamp real (elapsed×90000) a partir dele, ancorando o vídeo no mesmo eixo
+// de tempo do áudio (evita o congelamento por overflow do int32 no receptor).
+func (p *Pipeline) SetClock(c *media.MediaClock) {
+	p.mu.Lock()
+	p.clock = c
+	p.mu.Unlock()
 }
 
 func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, recvKM core.SrtpKeyingMaterial) error {
@@ -85,6 +129,46 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 	p.relay.SetStreamSsrcs(selfSsrcs, peerSsrcs)
 	p.log.Debug("video media set up", "self_video_ssrc", selfSsrc,
 		"stream_ssrcs", len(selfSsrcs)+len(peerSsrcs))
+	return nil
+}
+
+// SetupGroup configura o pipeline p/ chamada em GRUPO com SSRCs de vídeo EXPLÍCITOS
+// (derivados no esquema de grupo) e material SRTP já derivado do epoch. Não chama
+// SetStreamSsrcs (o relay de grupo gerencia a assinatura via Allocate). selfVideoSSRC
+// pode ser 0 em pipelines só de recepção; peerVideoSSRC é usado p/ filtrar o stream.
+func (p *Pipeline) SetupGroup(selfVideoSSRC uint32, sendKM, recvKM core.SrtpKeyingMaterial) error {
+	srtp, err := media.NewSrtpSession(sendKM, recvKM, core.SRTPSendAuthTagLen, core.SRTPRecvAuthTagLen)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.srtp = srtp
+	p.selfSsrc = selfVideoSSRC
+	p.rtp = media.NewH264Session(selfVideoSSRC)
+	if p.depack == nil {
+		p.depack = &transport.H264Depacketizer{}
+	}
+	p.frameNumber = 1
+	p.transportSeq = 0
+	p.keyframeRequired = true
+	p.lastAUAt = time.Time{}
+	p.mu.Unlock()
+	return nil
+}
+
+// RekeyGroup troca as chaves SRTP (envio e recepção) pro epoch novo do grupo,
+// preservando ROC/sequência e o resto do estado do pipeline.
+func (p *Pipeline) RekeyGroup(sendKM, recvKM core.SrtpKeyingMaterial) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.srtp == nil {
+		return nil
+	}
+	n, err := p.srtp.WithKeying(sendKM, recvKM)
+	if err != nil {
+		return err
+	}
+	p.srtp = n
 	return nil
 }
 
@@ -124,6 +208,7 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	frameNum := p.frameNumber
 	tseq := p.transportSeq
 	first := p.lastAUAt.IsZero()
+	clock := p.clock
 	p.mu.Unlock()
 	if rtp == nil || srtp == nil || !p.relay.HasConnection() || len(au) == 0 {
 		return
@@ -161,7 +246,13 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	if p.relay.BufferedAmount() > congestionDropBytes {
 		return
 	}
-	if !first {
+	if first {
+		// Ancora o 1º frame de vídeo no relógio de mídia da call (elapsed×90000), pro
+		// vídeo ficar no mesmo eixo de tempo do áudio mesmo num upgrade tardio.
+		if clock != nil {
+			rtp.SetTimestamp(clock.TimestampFor(90000))
+		}
+	} else {
 		rtp.AdvanceTimestamp(rtpStepSamples)
 	}
 	mediaFrameInfo := uint8(videoMediaFrameDelta)
@@ -193,7 +284,17 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	if idr {
 		p.keyframeRequired = false
 	}
+	p.stats.PacketsSent += uint32(len(payloads))
+	p.stats.OctetsSent += uint32(len(packed))
+	p.stats.RtpTimestamp = rtp.Timestamp()
 	p.mu.Unlock()
+}
+
+// SenderStats devolve os contadores de envio (pacotes/octetos/último timestamp RTP).
+func (p *Pipeline) SenderStats() media.RtcpSenderStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stats
 }
 
 func (p *Pipeline) HandleRelayData(data []byte) {
@@ -216,6 +317,7 @@ func (p *Pipeline) HandleRelayData(data []byte) {
 		return
 	}
 	nalus := depack.Depacketize(pkt.Payload)
+	orient, hasOrient := parseVideoOrientation(pkt.Header)
 
 	p.mu.Lock()
 	for _, nalu := range nalus {
@@ -228,8 +330,16 @@ func (p *Pipeline) HandleRelayData(data []byte) {
 		p.frameBuf = nil
 	}
 	cb := p.OnFrame
+	var orientCb func(int)
+	if hasOrient && orient != p.lastOrientation {
+		p.lastOrientation = orient
+		orientCb = p.OnOrientation
+	}
 	p.mu.Unlock()
 
+	if orientCb != nil {
+		orientCb(orient)
+	}
 	if frame != nil && cb != nil {
 		cb(frame)
 	}
@@ -246,5 +356,7 @@ func (p *Pipeline) Reset() {
 	p.frameNumber = 1
 	p.transportSeq = 0
 	p.keyframeRequired = true
+	p.stats = media.RtcpSenderStats{}
+	p.lastOrientation = -1
 	p.mu.Unlock()
 }

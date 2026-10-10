@@ -71,6 +71,7 @@ type Session struct {
 	SIPExtUser    string
 	SIPExtPass    string
 	SIPExtDest    string
+	SIPExtProxy   string // outbound proxy (host[:porta]) — p/ onde mandar REGISTER/INVITE; vazio = usa Host
 	// estado do registro no PBX externo (registering/registered/failed), atualizado
 	// pelo registrador UAC; exibido no painel. Protegido por s.mu.
 	sipExtStatus string
@@ -79,6 +80,15 @@ type Session struct {
 	// downAlerted evita repetir o aviso de "sessão desconectada" no Chatwoot
 	// enquanto ela segue caída; volta a false ao reconectar (events.Connected).
 	downAlerted bool
+
+	// Estado da última restrição/time-lock (shadow-ban 463) que o WhatsApp empurra
+	// via NotifyAccountReachoutTimelock. O protocolo não tem consulta — só push —,
+	// então guardamos o último estado em cache. Protegido por s.mu.
+	restrictionActive    bool
+	restrictionType      string
+	restrictionEndsAt    time.Time
+	restrictionUpdatedAt time.Time
+	restrictionAlerted   bool // evita repetir o alerta no Chatwoot enquanto ativa
 
 	// sentIDs guarda os IDs de mensagens que ESTE cliente enviou, com a origem
 	// (API ou agente do Chatwoot), para decidir o que fazer quando voltarem como
@@ -92,6 +102,13 @@ type Session struct {
 	// chegam em goroutines separadas e criariam contatos/conversas duplicados no
 	// Chatwoot se rodassem ensureContact/ensureConversation concorrentemente.
 	importMu sync.Mutex
+
+	// Chamada em GRUPO (experimental, atrás da flag WACALLS_GROUP_CALLS). Criado sob
+	// demanda. Protegido por s.mu.
+	groupCall *call.GroupCallManager
+	// Roster da chamada de grupo ativa: número do LID (parte antes do ':') -> telefone
+	// e nome, p/ o painel rotular os vídeos com número+nome em vez do @lid.
+	groupRoster map[string]groupRosterEntry
 }
 
 // Origem de uma mensagem enviada por nós. O agente do Chatwoot nunca é espelhado
@@ -534,11 +551,21 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 	cm.OnVideoUpgradeRequest = func(c *call.CallInfo) {
 		s.mgr.broker.emitVideoState(s.id, c.CallID, "upgrade-request", c.StateData.PeerVideoOn,
-			!c.StateData.VideoOff, c.StateData.VideoUpgradeIncoming, c.StateData.VideoUpgradeOutgoing)
+			!c.StateData.VideoOff, c.StateData.VideoUpgradeIncoming, c.StateData.VideoUpgradeOutgoing,
+			c.StateData.PeerVideoOrientation)
 	}
 	cm.OnVideoStateChanged = func(c *call.CallInfo) {
 		s.mgr.broker.emitVideoState(s.id, c.CallID, "state", c.StateData.PeerVideoOn,
-			!c.StateData.VideoOff, c.StateData.VideoUpgradeIncoming, c.StateData.VideoUpgradeOutgoing)
+			!c.StateData.VideoOff, c.StateData.VideoUpgradeIncoming, c.StateData.VideoUpgradeOutgoing,
+			c.StateData.PeerVideoOrientation)
+	}
+	cm.OnPeerMute = func(c *call.CallInfo) {
+		s.mgr.broker.emitCallAction(s.id, c.CallID, "peer-mute", c.StateData.PeerAudioMuted)
+		s.dispatchWebhook("call_peer_mute", map[string]any{"call_id": c.CallID, "muted": c.StateData.PeerAudioMuted})
+	}
+	cm.OnHandRaise = func(c *call.CallInfo) {
+		s.mgr.broker.emitCallAction(s.id, c.CallID, "peer-hand", c.StateData.PeerHandRaised)
+		s.dispatchWebhook("call_hand_raise", map[string]any{"call_id": c.CallID, "raised": c.StateData.PeerHandRaised})
 	}
 }
 
@@ -580,6 +607,14 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 	node := wrapCall(evt.From, evt.Data)
 	callID := callIDFromNode(node)
 	if callID == "" {
+		return
+	}
+	// Convite de chamada em GRUPO (somos membro do grupo que outro número ligou):
+	// não é chamada 1:1 — não cria call, não responde preaccept, não emite
+	// "incoming" nem arma reject por timeout. Ver isGroupCallOffer.
+	if g := groupJIDFromOffer(node); g != "" {
+		s.log.Info("convite de chamada em grupo recebido; ignorado no fluxo 1:1",
+			"call_id", callID, "from", evt.From.String(), "group_jid", g)
 		return
 	}
 	if max := s.mgr.maxCalls; max > 0 && s.reg.count() >= max {
@@ -704,6 +739,10 @@ func (s *Session) handleEvent(rawEvt any) {
 	case *events.ClientOutdated:
 		go s.notifyDisconnected("recusada pelo WhatsApp: cliente desatualizado",
 			"É necessário atualizar o AstraCalls. Avise o suporte técnico.")
+	case *events.NotifyAccountReachoutTimelock:
+		// Restrição/time-lock (shadow-ban 463): o WhatsApp limita o alcance do número
+		// (mensagem/chamada "somem" em silêncio). Único sinal programático da restrição.
+		go s.handleReachoutTimelock(evt)
 	case *events.Message:
 		switch {
 		case evt.Message.GetPollUpdateMessage() != nil:
@@ -769,6 +808,12 @@ func (s *Session) handleUnknownCall(ctx context.Context, evt *events.UnknownCall
 	if evt.Node == nil {
 		return
 	}
+	// Chamada em GRUPO (experimental): eventos de controle (group_update/enc_rekey)
+	// não entram no registro de chamadas 1:1 e podem não ter callID no formato do
+	// callIDFromNode — por isso roteamos ANTES do early-return. O manager decide.
+	if s.routeGroupUnknownCall(ctx, evt.Node) {
+		return
+	}
 	callID := callIDFromNode(evt.Node)
 	if callID == "" {
 		return
@@ -788,7 +833,16 @@ func (s *Session) handleUnknownCall(ctx context.Context, evt *events.UnknownCall
 		ac.cm.HandleCallTerminate(evt.Node) // → OnEnded → broker.endCall (avisa TODOS) + removeCall
 		return
 	}
-	ac.cm.HandleVideoState(ctx, evt.Node)
+	// Roteia por tipo de nó interno: mute_v2 e raise_hand (portados do zapo) têm
+	// handlers próprios; o resto segue pro tratamento de vídeo.
+	switch info := signaling.ExtractNodeInfo(evt.Node); {
+	case info != nil && info.Tag == "mute_v2":
+		ac.cm.HandleMuteV2(ctx, evt.Node)
+	case info != nil && (info.Tag == "user_action" || info.Tag == "raise_hand"):
+		ac.cm.HandleRaiseHand(ctx, evt.Node)
+	default:
+		ac.cm.HandleVideoState(ctx, evt.Node)
+	}
 }
 
 // nodeHasTerminalCall diz se um <call> traz um <terminate> ou <reject> entre os
@@ -875,7 +929,10 @@ func (s *Session) startPhonePairing(ctx context.Context, phone string) (string, 
 	if err := s.client.Connect(); err != nil {
 		return "", err
 	}
-	code, err := s.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "AstraCalls")
+	// O nome de exibição PRECISA ser "Navegador (SO)" com navegador/SO comuns: o
+	// servidor valida e devolve <error code="400" text="bad-request"/> pra
+	// qualquer outra coisa (era "AstraCalls" e o código nunca era gerado).
+	code, err := s.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		return "", err
 	}
@@ -931,6 +988,7 @@ func (s *Session) info() SessionInfo {
 	extUser := s.SIPExtUser
 	extPass := s.SIPExtPass
 	extDest := s.SIPExtDest
+	extProxy := s.SIPExtProxy
 	extStatus := s.sipExtStatus
 	extErr := s.sipExtError
 	s.mu.Unlock()
@@ -939,7 +997,7 @@ func (s *Session) info() SessionInfo {
 		Paired: a.Paired || jid != "", Recording: rec,
 		SIPUser: s.SIPUser, SIPPass: s.SIPPass, SIPURL: s.SIPURL,
 		SIPExtEnabled: extEnabled, SIPExtHost: extHost, SIPExtPort: extPort,
-		SIPExtUser: extUser, SIPExtPass: extPass, SIPExtDest: extDest,
+		SIPExtUser: extUser, SIPExtPass: extPass, SIPExtDest: extDest, SIPExtProxy: extProxy,
 		SIPExtStatus: extStatus, SIPExtError: extErr,
 	}
 }
@@ -1116,6 +1174,7 @@ type sipExtConfig struct {
 	User    string
 	Pass    string
 	Dest    string
+	Proxy   string // outbound proxy (host[:porta]); vazio = usa Host
 }
 
 func (s *Session) sipExtSnapshot() sipExtConfig {
@@ -1123,7 +1182,7 @@ func (s *Session) sipExtSnapshot() sipExtConfig {
 	defer s.mu.Unlock()
 	return sipExtConfig{
 		Enabled: s.SIPExtEnabled, Host: s.SIPExtHost, Port: s.SIPExtPort,
-		User: s.SIPExtUser, Pass: s.SIPExtPass, Dest: s.SIPExtDest,
+		User: s.SIPExtUser, Pass: s.SIPExtPass, Dest: s.SIPExtDest, Proxy: s.SIPExtProxy,
 	}
 }
 
@@ -1135,6 +1194,7 @@ func (s *Session) setSIPExt(c sipExtConfig) {
 	s.SIPExtUser = c.User
 	s.SIPExtPass = c.Pass
 	s.SIPExtDest = c.Dest
+	s.SIPExtProxy = c.Proxy
 	s.mu.Unlock()
 }
 

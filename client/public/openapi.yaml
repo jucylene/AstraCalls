@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: AstraCalls API
-  version: "1.0.2"
+  version: "1.1.1"
   description: |
     API HTTP do **AstraCalls** — chamadas de voz do WhatsApp pelo navegador.
 
@@ -24,6 +24,8 @@ tags:
     description: Contas WhatsApp (cada sessão = um device linkado)
   - name: Chamadas
     description: Iniciar, atender, rejeitar e encerrar chamadas
+  - name: SIP
+    description: Gateway SIP (sipgo nativo, sem Asterisk) — modelo 1 (PBX registra aqui) e modelo 2 (registrar em PBX externo, com outbound proxy)
   - name: Mensagens
     description: Envio e ações de mensagem (texto, mídia, localização, contato, enquete, reação, edição, exclusão, visto, digitando)
   - name: Contatos
@@ -150,10 +152,15 @@ components:
           items:
             type: object
             properties:
-              jid: { type: string }
-              number: { type: string }
+              jid: { type: string, description: "JID de envio (pode ser @lid)", example: "60838698344603@lid" }
+              phone: { type: string, description: "telefone real; vazio se o LID não resolver (nunca os dígitos do LID)", example: "556196878959" }
+              lid: { type: string, description: "LID quando conhecido", example: "60838698344603@lid" }
+              number: { type: string, description: "telefone quando conhecido; senão o user do JID (compat)" }
+              name: { type: string, description: "nome do contato (agenda, pushName ou nome comercial)", example: "Raphael" }
+              pushName: { type: string, description: "nome de perfil do WhatsApp" }
               isAdmin: { type: boolean }
               isSuperAdmin: { type: boolean }
+              admin: { type: boolean, description: "isAdmin || isSuperAdmin" }
               id: { type: string, description: "alias (número@c.us)" }
               pn: { type: string, description: "alias do número" }
               role: { type: string, enum: [participant, admin, superadmin] }
@@ -227,6 +234,10 @@ paths:
                 type: object
                 properties:
                   maxCallsPerSession: { type: integer, example: 8, description: "Máx. de chamadas simultâneas por sessão (0 = ilimitado)" }
+                  defaultTransport: { type: string, example: "websocket", description: "Transporte de mídia padrão (ex.: websocket); o widget usa p/ decidir WS vs WebRTC" }
+                  version: { type: string, example: "develop", description: "Build rodando (canal: develop/vX.Y.Z)" }
+                  commit: { type: string, example: "c9ac957", description: "SHA do commit do build" }
+                  groupCalls: { type: boolean, example: false, description: "Chamada em grupo (experimental) habilitada nesta instância (WACALLS_GROUP_CALLS)" }
 
   /api/sessions:
     get:
@@ -474,6 +485,294 @@ paths:
       responses:
         "204": { description: Desconectada }
 
+  /api/sessions/{sid}/calls/group:
+    post:
+      tags: [Chamadas]
+      summary: "[EXPERIMENTAL] Inicia uma chamada em GRUPO (áudio + vídeo)"
+      description: >
+        Cria uma chamada em grupo ad-hoc (2+ números). EXPERIMENTAL e desligado por
+        padrão — requer a env `WACALLS_GROUP_CALLS=1` no servidor; sem ela retorna 501.
+        O control plane (offer, roster, troca da chave de epoch) e a criptografia estão
+        implementados e validados; o acoplamento com o relay de grupo precisa de
+        validação em chamada real.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numbers]
+              properties:
+                numbers:
+                  type: array
+                  items: { type: string }
+                  minItems: 2
+                  example: ["5511999990001", "5511999990002"]
+                groupJid: { type: string, example: "1234-5678@g.us" }
+                video: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Offer de grupo enviado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  callId: { type: string }
+                  targets: { type: integer }
+                  video: { type: boolean }
+        "501": { description: Chamada em grupo desligada (experimental) }
+  /api/sessions/{sid}/calls/group/end:
+    post:
+      tags: [Chamadas]
+      summary: "[EXPERIMENTAL] Encerra a chamada em grupo ativa"
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      responses:
+        "200": { description: Encerrada }
+        "404": { description: Nenhuma chamada em grupo ativa }
+  /api/sessions/{sid}/calls/group/ws:
+    get:
+      tags: [Chamadas]
+      summary: "[EXPERIMENTAL] WebSocket de ÁUDIO da chamada em grupo (PCM16)"
+      description: >
+        Upgrade WebSocket (subprotocolo `pcm16`) para o atendente OUVIR o mix de áudio
+        de todos os participantes e FALAR pelo microfone do navegador. Full-duplex com
+        frames binários PCM16 mono. Requer `WACALLS_GROUP_CALLS=1` e uma chamada de
+        grupo ativa. Query opcional `?events=1` habilita eventos de texto no stream.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+        - name: events
+          in: query
+          required: false
+          schema: { type: string, enum: ["1", "true"] }
+          description: Habilita eventos de texto no stream
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "404": { description: Nenhuma chamada em grupo ativa }
+        "501": { description: Chamada em grupo desligada (experimental) }
+  /api/sessions/{sid}/calls/group/video-ws:
+    get:
+      tags: [Chamadas]
+      summary: "[EXPERIMENTAL] WebSocket de VÍDEO da chamada em grupo (H264)"
+      description: >
+        Upgrade WebSocket (subprotocolo `h264-group`) para transportar vídeo H264
+        (Annex-B) entre o navegador e o gateway. gateway→navegador: frames binários
+        `[1 byte len(pid)][pid ascii][access unit H264]` (um por participante);
+        navegador→gateway: access unit H264 puro (câmera do atendente). Separado do WS
+        de áudio. Requer `WACALLS_GROUP_CALLS=1` e uma chamada de grupo ativa.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "404": { description: Nenhuma chamada em grupo ativa }
+        "501": { description: Chamada em grupo desligada (experimental) }
+  /api/sessions/{sid}/calls/group/roster:
+    get:
+      tags: [Chamadas]
+      summary: "[EXPERIMENTAL] Roster da chamada em grupo (número do LID → telefone + nome)"
+      description: >
+        Devolve o mapa número-do-LID → telefone e nome dos participantes da chamada de
+        grupo ativa, para o painel rotular os vídeos com número+nome em vez do @lid.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roster:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        phone: { type: string, example: "556199999999" }
+                        name: { type: string, example: "Fulano" }
+  /api/sip/status:
+    get:
+      tags: [SIP]
+      summary: Status do gateway SIP (registros e chamadas ativas)
+      description: >
+        Estado global do gateway SIP (sipgo nativo, sem Asterisk): se está ligado, a
+        porta, os registros (modelo 1 — PBX registrado aqui) e as chamadas SIP ativas.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, example: true }
+                  port: { type: integer, example: 5060 }
+                  registrations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sip_user: { type: string }
+                        session_id: { type: string }
+                        contact: { type: string }
+                  active_calls:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sip_call_id: { type: string }
+                        session_id: { type: string }
+                        wa_call_id: { type: string }
+                        from: { type: string }
+                        to: { type: string }
+  /api/sessions/{sid}/sip:
+    get:
+      tags: [SIP]
+      summary: "SIP modelo 1 — credenciais p/ um PBX/softphone registrar NESTA sessão"
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sip_user: { type: string }
+                  sip_pass: { type: string }
+                  sip_url: { type: string, description: "URL/host onde o PBX/softphone registra" }
+                  sip_realm: { type: string, example: "astracalls" }
+                  sip_port: { type: integer, example: 5060 }
+                  codecs: { type: array, items: { type: string }, example: ["PCMU/8000"] }
+                  session_id: { type: string }
+    post:
+      tags: [SIP]
+      summary: "SIP modelo 1 — grava as credenciais de registro desta sessão"
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sip_user: { type: string }
+                sip_pass: { type: string }
+                sip_url: { type: string }
+      responses:
+        "200": { description: Atualizado }
+        "400": { description: Body inválido }
+  /api/sessions/{sid}/sip-ext:
+    get:
+      tags: [SIP]
+      summary: "SIP modelo 2 — config de registro desta sessão num PBX EXTERNO"
+      description: >
+        Modelo 2 (UAC): a sessão se registra como ramal/tronco num PBX do cliente
+        (sipgo nativo, SIP puro + RTP, sem Asterisk por baixo). O campo `proxy`
+        (outbound proxy) separa o SERVIDOR do DOMÍNIO — necessário em FreePBX e
+        troncos hospedados (registra como `user@host`, mas manda os pacotes pro proxy).
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  host: { type: string, description: "Domínio/host do PBX (vai na URI user@host)" }
+                  port: { type: integer, example: 5060 }
+                  user: { type: string }
+                  pass: { type: string }
+                  dest: { type: string, description: "Ramal/fila que toca quando chega chamada do WhatsApp (opcional)" }
+                  proxy: { type: string, description: "Outbound proxy host[:porta] — p/ onde enviar REGISTER/INVITE; vazio = usa host" }
+                  status: { type: string, example: "registered", description: "registering/registered/failed" }
+                  error: { type: string }
+                  advertise: { type: string, description: "host:porta SIP anunciado no Contact" }
+    post:
+      tags: [SIP]
+      summary: "SIP modelo 2 — grava/aplica o registro no PBX externo"
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host, user]
+              properties:
+                enabled: { type: boolean }
+                host: { type: string, example: "pbx.cliente.com" }
+                port: { type: integer, default: 5060 }
+                user: { type: string, example: "1001" }
+                pass: { type: string }
+                dest: { type: string, example: "600" }
+                proxy: { type: string, example: "sip.provedor.com:5060", description: "Outbound proxy (host[:porta]); vazio = usa host" }
+      responses:
+        "200": { description: Atualizado }
+        "400": { description: "host e usuário são obrigatórios / body inválido" }
+  /api/sessions/{sid}/restriction-status:
+    get:
+      tags: [Sessão]
+      summary: Estado de restrição/shadow-ban (time-lock 463) do número
+      description: >
+        Informa se o WhatsApp aplicou uma restrição de alcance (time-lock / 463)
+        neste número — quando ativa, mensagens e chamadas para quem ainda não te
+        respondeu podem "sumir" em silêncio. O WhatsApp só EMPURRA esse estado (não
+        há consulta ativa no protocolo), então o retorno é o do último evento
+        recebido (em cache). Com `?peer=<telefone>` também diz se há token de
+        privacidade e mapeamento LID para aquele contato (diagnóstico anti-463).
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { $ref: "#/components/parameters/ClientId" }
+        - name: peer
+          in: query
+          required: false
+          schema: { type: string }
+          description: Telefone do contato para checar token/LID (ex. 5511999999999)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { type: string, example: "astrachat_acc12" }
+                  restriction:
+                    type: object
+                    properties:
+                      active: { type: boolean, example: true }
+                      enforcement_type: { type: string, example: "reachout_timelock" }
+                      ends_at: { type: integer, example: 1730600000000, description: "epoch ms (0 se desconhecido)" }
+                      seconds_remaining: { type: integer, example: 54231 }
+                      updated_at: { type: integer, example: 1730545769000 }
+                  peer:
+                    type: object
+                    description: Só quando ?peer= é passado
+                    properties:
+                      pn: { type: string, example: "5511999999999@s.whatsapp.net" }
+                      lid: { type: string }
+                      lid_mapped: { type: boolean }
+                      has_tctoken: { type: boolean }
+        "404": { description: Sessão inexistente }
   /api/sessions/{sid}/calls:
     get:
       tags: [Chamadas]
@@ -593,7 +892,7 @@ paths:
                 quotedMessageId: { type: string, description: "Cita (responde) a mensagem com esse id. O remetente/conteúdo da citada é resolvido automaticamente." }
                 participant: { type: string, description: "Opcional. Em grupo, o JID de quem enviou a mensagem citada (só se a resolução automática não achar)." }
                 fromMe: { type: boolean, description: "Opcional. true se a mensagem citada foi enviada por você." }
-                mentions: { type: array, items: { type: string }, description: "Números ou JIDs a mencionar (@). O texto deve conter os @ correspondentes.", example: ["5561999999999"] }
+                mentions: { type: array, items: { type: string }, description: "Números ou JIDs a mencionar (@). O texto deve conter os @ correspondentes. Em GRUPO, se omitido, o gateway detecta sozinho os `@<8..15 dígitos>` do texto.", example: ["5561999999999"] }
       responses:
         "200": { $ref: "#/components/responses/SendOK" }
         "503": { description: Conta não pareada }
@@ -804,7 +1103,7 @@ paths:
                 account_token: { type: string, example: "xxxxxxxxxxxxxxxx" }
                 inbox_id: { type: integer, example: 5 }
                 inbox_identifier: { type: string, example: "abcd1234" }
-                groups: { type: boolean, default: false, description: "Abrir conversas de GRUPOS no Chatwoot (mensagens prefixadas com o autor)" }
+                groups: { type: boolean, default: false, description: "Abrir conversas de GRUPOS no Chatwoot. Cada mensagem é prefixada com o autor (*Nome*:) e leva em content_attributes: wa_participant (JID de envio), wa_participant_phone (telefone real ou vazio), wa_participant_lid, wa_participant_name. No envio pelo webhook, @<número> no texto vira menção." }
                 channels: { type: boolean, default: false, description: "Abrir conversas de CANAIS (newsletters) no Chatwoot" }
                 groups_skip_incoming: { type: boolean, default: false, description: "Com groups=true, NÃO reflete as mensagens dos outros membros do grupo — só posta as msgs do próprio aparelho (nota privada) e os avisos de entrada/saída/admin. Evita duplicação quando outra fonte já traz as mensagens do grupo pro mesmo inbox" }
                 sign_msg: { type: boolean, default: false, description: "Assinatura do atendente: prefixa *Nome*\\n no texto e na legenda de mídia das mensagens de SAÍDA (o nome vem do sender do webhook; não fica salvo na conversa do Chatwoot)" }
@@ -1437,11 +1736,21 @@ paths:
     get:
       tags: [Grupos]
       summary: Lista os participantes
+      description: |
+        Cada item traz `jid` (de envio, pode ser `@lid`), `phone` (telefone real ou vazio),
+        `lid`, `name`/`pushName` e `admin`. Para mencionar alguém no envio, use `phone`
+        (ou os dígitos do `lid` quando não há telefone) como `@<dígitos>` no texto.
       parameters:
         - { $ref: "#/components/parameters/Sid" }
         - { $ref: "#/components/parameters/Gid" }
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Group/properties/participants/items" }
 
   /api/sessions/{sid}/groups/{gid}/participants/add:
     post:

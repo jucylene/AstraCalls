@@ -19,8 +19,14 @@ type CallStateData struct {
 
 	// Negociação de vídeo mid-call (só relevante com a call ativa).
 	PeerVideoOn          bool // câmera do peer está ligada
+	PeerVideoOrientation int  // rotação da câmera do peer em quartos de volta horários (0..3), lida do RTP
 	VideoUpgradeIncoming bool // o peer pediu upgrade e aguarda nossa decisão
 	VideoUpgradeOutgoing bool // nós pedimos upgrade e aguardamos o peer
+
+	// Ações mid-call portadas do zapo (mute_v2 / raise_hand).
+	PeerAudioMuted bool // microfone do peer está mudo (anunciado via <mute_v2>)
+	PeerHandRaised bool // o peer levantou a mão (<user_action raise_hand>)
+	HandRaised     bool // nós levantamos a mão
 }
 
 type CallInfo struct {
