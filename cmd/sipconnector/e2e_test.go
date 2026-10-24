@@ -135,8 +135,15 @@ func startFakePBX(t *testing.T, ctx context.Context) *fakePBX {
 			p.onRefer(req, tx)
 		}
 	})
-	go func() { _ = srv.ListenAndServe(ctx, "udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port))) }()
-	t.Cleanup(func() { p.rtp.Close() })
+	connection, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.ServeUDP(connection) }()
+	t.Cleanup(func() {
+		_ = connection.Close()
+		_ = p.rtp.Close()
+	})
 	return p
 }
 
@@ -502,7 +509,9 @@ func TestAuthIDSeparadoDoRamal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pbx := startFakePBX(t, ctx)
+	pbx.mu.Lock()
 	pbx.creds = map[string][2]string{"800": {"Xk7pQ2mZ", "s3nha"}, "201": {"Ab12Cd34", "outra"}}
+	pbx.mu.Unlock()
 	s := startConnector(t, ctx)
 
 	line := Line{ID: "inbox3cx", AccountID: 1, Enabled: true, Mode: modeRegisterOut, Host: "127.0.0.1",

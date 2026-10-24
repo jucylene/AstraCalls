@@ -24,12 +24,12 @@ func TestSIPInviteFromOtherIPNeedsDigest(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = gw.server.ListenAndServe(ctx, "udp", "127.0.0.1:15095") }()
+	serveTestSIPUDP(t, gw.server, "127.0.0.1:15095")
 
 	ua, _ := sipgo.NewUA()
 	cli, _ := sipgo.NewClient(ua, sipgo.WithClientHostname("127.0.0.1"), sipgo.WithClientPort(15096))
 	pbx, _ := sipgo.NewServer(ua)
-	go func() { _ = pbx.ListenAndServe(ctx, "udp", "127.0.0.1:15096") }()
+	serveTestSIPUDP(t, pbx, "127.0.0.1:15096")
 	time.Sleep(200 * time.Millisecond)
 
 	register := func(ip string) {

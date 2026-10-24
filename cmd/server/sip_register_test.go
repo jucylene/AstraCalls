@@ -24,12 +24,12 @@ func TestSIPRegisterOKHasContact(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = gw.server.ListenAndServe(ctx, "udp", "127.0.0.1:15093") }()
+	serveTestSIPUDP(t, gw.server, "127.0.0.1:15093")
 
 	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("3CX-test"))
 	cli, _ := sipgo.NewClient(ua, sipgo.WithClientHostname("127.0.0.1"), sipgo.WithClientPort(15094))
 	pbx, _ := sipgo.NewServer(ua) // recebe as respostas na porta do Via
-	go func() { _ = pbx.ListenAndServe(ctx, "udp", "127.0.0.1:15094") }()
+	serveTestSIPUDP(t, pbx, "127.0.0.1:15094")
 	time.Sleep(200 * time.Millisecond)
 
 	target := sip.Uri{Scheme: "sip", Host: "127.0.0.1", Port: 15093}

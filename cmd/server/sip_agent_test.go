@@ -132,7 +132,7 @@ func TestSIPAgentEndToEnd(t *testing.T) {
 	gw.extRegs["s1"] = &sipUACRegistrar{gw: gw, sessionID: "s1", cfg: sess.sipExtSnapshot()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = gw.server.ListenAndServe(ctx, "udp", "127.0.0.1:15091") }()
+	serveTestSIPUDP(t, gw.server, "127.0.0.1:15091")
 
 	sub := broker.subscribe("t", 0)
 	defer broker.unsubscribe(sub)
@@ -141,7 +141,7 @@ func TestSIPAgentEndToEnd(t *testing.T) {
 	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("pbx-test"))
 	cli, _ := sipgo.NewClient(ua, sipgo.WithClientHostname("127.0.0.1"), sipgo.WithClientPort(15092))
 	srv, _ := sipgo.NewServer(ua)
-	go func() { _ = srv.ListenAndServe(ctx, "udp", "127.0.0.1:15092") }()
+	serveTestSIPUDP(t, srv, "127.0.0.1:15092")
 	time.Sleep(200 * time.Millisecond)
 
 	pbxRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -303,7 +303,7 @@ func newAgentHarness(t *testing.T, sipPort, pbxPort int, opts sipAgentOpts) *age
 	gw.extRegs["s1"] = &sipUACRegistrar{gw: gw, sessionID: "s1", cfg: sess.sipExtSnapshot()}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = gw.server.ListenAndServe(ctx, "udp", "127.0.0.1:"+itoa(sipPort)) }()
+	serveTestSIPUDP(t, gw.server, "127.0.0.1:"+itoa(sipPort))
 	sub := broker.subscribe("t", 0)
 	t.Cleanup(func() { broker.unsubscribe(sub) })
 	ua, _ := sipgo.NewUA()
@@ -314,7 +314,7 @@ func newAgentHarness(t *testing.T, sipPort, pbxPort int, opts sipAgentOpts) *age
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 		bye <- struct{}{}
 	})
-	go func() { _ = srv.ListenAndServe(ctx, "udp", "127.0.0.1:"+itoa(pbxPort)) }()
+	serveTestSIPUDP(t, srv, "127.0.0.1:"+itoa(pbxPort))
 	time.Sleep(200 * time.Millisecond)
 	dua := &sipgo.DialogUA{Client: cli, ContactHDR: sip.ContactHeader{Address: sip.Uri{Scheme: "sip", User: "pbx", Host: "127.0.0.1", Port: pbxPort}}}
 	return &agentHarness{gw: gw, sess: sess, sub: sub, dua: dua, ctx: ctx, bye: bye}
