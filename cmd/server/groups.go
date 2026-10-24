@@ -68,10 +68,13 @@ func (s *Session) participantJSON(p types.GroupParticipant) map[string]any {
 		"isAdmin":      p.IsAdmin,
 		"isSuperAdmin": p.IsSuperAdmin,
 		"admin":        p.IsAdmin || p.IsSuperAdmin,
-		// aliases WAHA
+		// aliases WAHA: id/pn usam o telefone quando conhecido (nunca dígitos do LID em pn)
 		"id":   waChatID(p.JID),
-		"pn":   number,
+		"pn":   phone,
 		"role": waRole(p.IsAdmin, p.IsSuperAdmin),
+	}
+	if phone != "" {
+		out["id"] = waChatID(types.NewJID(phone, types.DefaultUserServer))
 	}
 	if !lid.IsEmpty() {
 		out["lid"] = lid.String()
@@ -123,11 +126,13 @@ func (s *Session) groupJSON(g *types.GroupInfo) map[string]any {
 	for _, p := range g.Participants {
 		parts = append(parts, s.participantJSON(p))
 	}
-	return map[string]any{
+	out := map[string]any{
 		"jid":          g.JID.String(),
 		"name":         g.Name,
 		"topic":        g.Topic,
 		"owner":        g.OwnerJID.String(),
+		"ownerPhone":   "",
+		"ownerLid":     "",
 		"announce":     g.IsAnnounce, // só admins enviam
 		"locked":       g.IsLocked,   // só admins editam info
 		"created":      g.GroupCreated.UnixMilli(),
@@ -136,7 +141,57 @@ func (s *Session) groupJSON(g *types.GroupInfo) map[string]any {
 		"id":          g.JID.String(), // grupos já são @g.us
 		"subject":     g.Name,
 		"description": g.Topic,
+		// comunidade: isCommunity = a própria comunidade; parentJid = comunidade
+		// à qual o grupo está vinculado; isAnnouncementGroup = grupo de avisos dela
+		"isCommunity":         g.IsParent,
+		"parentJid":           "",
+		"isAnnouncementGroup": g.IsDefaultSubGroup,
 	}
+	// dono: em grupo LID o OwnerJID é @lid; expõe o telefone quando conhecido
+	ownerPN := g.OwnerPN
+	if ownerPN.IsEmpty() && g.OwnerJID.Server == types.DefaultUserServer {
+		ownerPN = g.OwnerJID
+	}
+	if g.OwnerJID.Server == types.HiddenUserServer {
+		out["ownerLid"] = g.OwnerJID.String()
+		if ownerPN.IsEmpty() {
+			if p, ok := s.resolvedPhone(g.OwnerJID); ok {
+				ownerPN = types.NewJID(p, types.DefaultUserServer)
+			}
+		}
+	}
+	if !ownerPN.IsEmpty() {
+		out["ownerPhone"] = ownerPN.User
+		out["owner"] = ownerPN.ToNonAD().String()
+	}
+	if !g.LinkedParentJID.IsEmpty() {
+		out["parentJid"] = g.LinkedParentJID.String()
+	}
+	return out
+}
+
+// canonicalParticipants troca (in-place) cada PN pelo PN canônico registrado no
+// WhatsApp. 9º dígito BR: add/create com a forma errada volta error=451 ou
+// simplesmente não adiciona.
+func (s *Session) canonicalParticipants(ctx context.Context, parts []types.JID) {
+	for i, p := range parts {
+		if p.Server != types.DefaultUserServer {
+			continue
+		}
+		if _, pn, ok := s.resolveCanonical(ctx, p); ok && pn.User != "" && pn.User != p.User {
+			parts[i] = pn
+		}
+	}
+}
+
+// participantPhone devolve o telefone real de um participante (PN informado
+// pelo WhatsApp ou mapeado do LID); "" quando não resolve.
+func (s *Session) participantPhone(jid, pn types.JID) string {
+	if pn.User != "" && pn.Server == types.DefaultUserServer {
+		return pn.User
+	}
+	p, _ := s.resolvedPhone(jid)
+	return p
 }
 
 // group carrega a sessão pareada + o JID do grupo do path, ou escreve o erro.
@@ -172,6 +227,7 @@ func (s *server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	sess.canonicalParticipants(r.Context(), parts)
 	g, err := sess.client.CreateGroup(r.Context(), whatsmeow.ReqCreateGroup{Name: b.Name, Participants: parts})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -236,26 +292,46 @@ func (s *server) handleGroupParticipantChange(action whatsmeow.ParticipantChange
 		}
 		var b struct {
 			Participants []string `json:"participants"`
+			// ShareHistory (só no add): compartilha as últimas N mensagens do grupo
+			// com quem entrou (recurso "histórico do grupo" do WhatsApp). true = 50.
+			ShareHistory json.RawMessage `json:"shareHistory"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&b); err != nil || len(b.Participants) == 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "participants required"})
 			return
 		}
+		shareCount := parseShareHistory(b.ShareHistory)
 		parts, err := resolveParticipants(b.Participants)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		sess.canonicalParticipants(r.Context(), parts)
 		res, err := sess.client.UpdateGroupParticipants(r.Context(), gid, parts, action)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
 		out := make([]map[string]any, 0, len(res))
+		var added []string
 		for _, p := range res {
-			out = append(out, map[string]any{"jid": p.JID.String(), "isAdmin": p.IsAdmin})
+			row := map[string]any{"jid": p.JID.String(), "phone": sess.participantPhone(p.JID, p.PhoneNumber), "isAdmin": p.IsAdmin}
+			if p.Error != 0 {
+				row["error"] = p.Error
+			} else {
+				added = append(added, p.JID.String())
+			}
+			out = append(out, row)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "participants": out})
+		resp := map[string]any{"ok": true, "participants": out}
+		if action == whatsmeow.ParticipantChangeAdd && shareCount > 0 && len(added) > 0 {
+			if hr, herr := sess.shareGroupHistory(r.Context(), gid, added, shareCount); herr != nil {
+				resp["historyError"] = herr.Error()
+			} else {
+				resp["history"] = hr
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -446,4 +522,21 @@ func inviteCode(s string) string {
 		s = s[i+1:]
 	}
 	return s
+}
+
+// parseShareHistory interpreta o campo shareHistory: true → 50, número → N,
+// false/ausente → 0 (não compartilha).
+func parseShareHistory(raw json.RawMessage) int {
+	v := strings.TrimSpace(string(raw))
+	switch v {
+	case "", "null", "false", "0":
+		return 0
+	case "true":
+		return groupHistoryDefaultCnt
+	}
+	var f flexFloat
+	if err := json.Unmarshal(raw, &f); err != nil || f <= 0 {
+		return 0
+	}
+	return int(f)
 }

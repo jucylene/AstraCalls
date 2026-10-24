@@ -27,6 +27,7 @@ type CallRecord struct {
 	Held      bool       `json:"held"`
 	EndedAt   *int64     `json:"endedAt,omitempty"`
 	EndReason string     `json:"endReason,omitempty"`
+	Source    string     `json:"source,omitempty"` // "sip" no modo agente; vazio = WhatsApp
 }
 
 type AuthSnapshot struct {
@@ -58,6 +59,8 @@ type SessionInfo struct {
 	SIPExtProxy   string `json:"sip_ext_proxy"`
 	SIPExtStatus  string `json:"sip_ext_status"`
 	SIPExtError   string `json:"sip_ext_error"`
+	// modo do INVITE entrante: originate | agent | auto.
+	SIPExtInboundMode string `json:"sip_ext_inbound_mode"`
 }
 
 type subscriber struct {
@@ -190,6 +193,12 @@ func (b *Broker) emitTransferOffer(sessionID, id, peer, from, target string) {
 // alguém atende.
 func (b *Broker) emitTransferClaimed(sessionID, id, owner string) {
 	b.broadcastForSession(sessionID, map[string]any{"type": "call-transfer-claimed", "sessionId": sessionID, "id": id, "owner": owner})
+}
+
+// emitWebRTCFailed avisa os painéis que o áudio do navegador não conectou numa
+// chamada que continua de pé (o painel pode tentar /webrtc de novo).
+func (b *Broker) emitWebRTCFailed(sessionID, id, reason string) {
+	b.broadcastForSession(sessionID, map[string]any{"type": "call-webrtc-failed", "sessionId": sessionID, "id": id, "reason": reason})
 }
 
 func (b *Broker) emitAuthState(sessionID string, a AuthSnapshot) {
@@ -327,7 +336,18 @@ func (b *Broker) emitIncoming(sessionID, id, peer, phone, name string, video boo
 	b.broadcastForSession(sessionID, map[string]any{
 		"type": "incoming", "sessionId": sessionID, "id": id, "peer": peer,
 		"phone": phone, "name": name,
-		"video": video, "offeredAt": time.Now().UnixMilli(),
+		"video": video, "offeredAt": time.Now().UnixMilli(), "source": "whatsapp",
+	})
+}
+
+// emitIncomingSIP é o "incoming" de uma ligação SIP atendida pelo modo agente:
+// mesmo formato da chamada WhatsApp (peer = phone = número do chamador) + source
+// "sip" e o bloco sip {callId, from, to, codec}.
+func (b *Broker) emitIncomingSIP(sessionID, id, phone, name string, sipInfo map[string]any) {
+	b.broadcastForSession(sessionID, map[string]any{
+		"type": "incoming", "sessionId": sessionID, "id": id, "peer": phone,
+		"phone": phone, "name": name, "video": false, "offeredAt": time.Now().UnixMilli(),
+		"source": "sip", "sip": sipInfo,
 	})
 }
 
@@ -369,6 +389,22 @@ func (b *Broker) subscriberScope(sessionID string) (acct, total, matched, widget
 		matched++
 	}
 	return
+}
+
+// emitCallVolume avisa as UIs que o ganho do áudio da chamada mudou (POST /volume),
+// para o controle de volume ficar sincronizado entre painel/widgets.
+func (b *Broker) emitCallVolume(sessionID, id string, level float64) {
+	b.broadcastForSession(sessionID, map[string]any{
+		"type": "call-volume", "sessionId": sessionID, "id": id, "level": level,
+	})
+}
+
+// emitCallSpy avisa que alguém começou/parou de espiar a chamada (count = nº de
+// ouvintes). Mesmo formato do call-action (kind=spy, state = tem alguém ouvindo).
+func (b *Broker) emitCallSpy(sessionID, id string, count int) {
+	b.broadcastForSession(sessionID, map[string]any{
+		"type": "call-action", "sessionId": sessionID, "id": id, "kind": "spy", "state": count > 0, "count": count,
+	})
 }
 
 func (b *Broker) emitIncomingClaimed(sessionID, id, owner string) {

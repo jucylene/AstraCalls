@@ -54,6 +54,10 @@ export type SIPExtConfig = {
   pass: string;
   dest: string;
   proxy?: string;
+  // INVITE que chega no ramal: originate (disca no WhatsApp) | agent (agente de voz) | auto
+  inboundMode?: "originate" | "agent" | "auto";
+  agentAutoAnswer?: boolean;
+  agentRingTimeoutSeconds?: number;
   status?: string;
   error?: string;
   advertise?: string;
@@ -82,3 +86,22 @@ export const setProxy = async (id: string, proxy: string): Promise<void> => {
     throw new Error(msg);
   }
 };
+
+// Formulários nativos do app WhatsApp Business que a conta já enviou (GET /native-forms).
+export type NativeFormInfo = {
+  flowId: string;
+  flowName?: string;
+  formType?: string;
+  body?: string;
+  cta?: string;
+  screen?: string;
+  data?: Record<string, unknown>;
+  fields?: string[];
+  sentCount: number;
+  lastSentAt?: number;
+  responseCount: number;
+  lastResponseAt?: number;
+};
+
+export const listNativeForms = (id: string) =>
+  apiGet<{ forms: NativeFormInfo[]; count: number }>(`/api/sessions/${id}/native-forms`);

@@ -10,28 +10,56 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// dispatchWebhook envia um evento para a URL de webhook da sessão (se houver),
-// de forma assíncrona. Formato: {session, event, timestamp, data}.
+// dispatchWebhook envia um evento para os webhooks da sessão (se houver), de
+// forma assíncrona. Formato: {session, event, timestamp, data}. Cada webhook
+// aplica o próprio filtro (eventos / ignorar grupos).
 func (s *Session) dispatchWebhook(event string, data any) {
-	url := s.getWebhook()
-	if url == "" {
+	hooks := s.getWebhooks()
+	if len(hooks) == 0 {
 		return
 	}
-	if !s.webhookWants(event) {
-		return // filtrado: a sessão não assina este tipo de evento
+	var body []byte
+	for _, h := range hooks {
+		if h.URL == "" || !h.wants(event, data) {
+			continue
+		}
+		if body == nil {
+			b, err := json.Marshal(map[string]any{
+				"session":   s.id,
+				"event":     event,
+				"timestamp": time.Now().UnixMilli(),
+				"data":      data,
+			})
+			if err != nil {
+				return
+			}
+			body = b
+		}
+		// Entrega confiável (retry/backoff + circuit breaker + DLQ) + assinatura HMAC
+		// opcional (X-Webhook-Signature) quando o webhook tem secret.
+		whDeliver.deliver(whTarget{session: s.id, hook: h.ID, url: h.URL, secret: h.Secret}, event, body)
 	}
-	body, err := json.Marshal(map[string]any{
-		"session":   s.id,
-		"event":     event,
-		"timestamp": time.Now().UnixMilli(),
-		"data":      data,
-	})
-	if err != nil {
-		return
+}
+
+// isGroupWebhookEvent diz se o evento é de um GRUPO: group_participants sempre;
+// nos demais, pelo isGroup do payload ou por chat/group/from em @g.us.
+func isGroupWebhookEvent(event string, data any) bool {
+	if event == "group_participants" {
+		return true
 	}
-	// Entrega confiável (retry/backoff + circuit breaker + DLQ) + assinatura HMAC
-	// opcional (X-Webhook-Signature) quando há secret configurado na sessão.
-	whDeliver.deliver(s.id, url, event, body, s.getWebhookSecret())
+	m, ok := data.(map[string]any)
+	if !ok {
+		return false
+	}
+	if g, _ := m["isGroup"].(bool); g {
+		return true
+	}
+	for _, k := range []string{"chat", "group", "from"} {
+		if v, _ := m[k].(string); strings.HasSuffix(v, "@g.us") {
+			return true
+		}
+	}
+	return false
 }
 
 // summarizeMessage extrai os campos úteis de uma mensagem recebida e inclui o
@@ -166,6 +194,15 @@ func unwrapBotForwarded(m *waE2E.Message) *waE2E.Message {
 	return m
 }
 
+// groupStatusInner devolve a mensagem de dentro de um status do grupo
+// (groupStatusMessageV2 / groupStatusMessage), ou nil.
+func groupStatusInner(m *waE2E.Message) *waE2E.Message {
+	if in := m.GetGroupStatusMessageV2().GetMessage(); in != nil {
+		return in
+	}
+	return m.GetGroupStatusMessage().GetMessage()
+}
+
 // richResponseText junta o texto dos submessages de uma AIRichResponseMessage.
 func richResponseText(m *waE2E.Message) string {
 	var parts []string
@@ -221,6 +258,13 @@ func messageText(m *waE2E.Message) string {
 	m, _ = unwrapViewOnce(m)
 	m = unwrapDocCaption(m)
 	m = unwrapBotForwarded(m)
+	if gs := groupStatusInner(m); gs != nil {
+		// status do grupo (24 h na aba Atualizações): aparece no histórico com rótulo.
+		if t := messageText(gs); t != "" {
+			return "📢 Status do grupo: " + t
+		}
+		return "📢 Status do grupo"
+	}
 	switch {
 	case m.GetConversation() != "":
 		return m.GetConversation()
@@ -270,6 +314,9 @@ func messageText(m *waE2E.Message) string {
 // interactiveResponseText extrai a escolha de uma resposta interativa (nativeFlow:
 // quick_reply/cta). Usa o Body se houver; senão o "id" do buttonParamsJson.
 func interactiveResponseText(ir *waE2E.InteractiveResponseMessage) string {
+	if fr, ok := parseNativeFormResponse(ir); ok {
+		return fr.summary()
+	}
 	if b := ir.GetBody(); b != nil && b.GetText() != "" {
 		return b.GetText()
 	}
@@ -292,6 +339,9 @@ func messageType(m *waE2E.Message) string {
 	m, _, _ = unwrapEdit(m)
 	m, _ = unwrapViewOnce(m)
 	m = unwrapDocCaption(m)
+	if groupStatusInner(m) != nil {
+		return "group_status"
+	}
 	switch {
 	case m.GetConversation() != "" || m.GetExtendedTextMessage() != nil:
 		return "text"

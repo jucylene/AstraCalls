@@ -22,32 +22,11 @@ var (
 	browserAPI     *webrtc.API
 )
 
-// detectPublicIP descobre o IP de saída (rota padrão) sem enviar pacotes.
-// Em rede de host num VPS com IP público na interface, isso retorna o IP público.
-func detectPublicIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	if a, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-		return a.IP.String()
-	}
-	return ""
-}
-
 func getBrowserAPI(log *slog.Logger) *webrtc.API {
 	browserAPIOnce.Do(func() {
-		publicIP := os.Getenv("WACALLS_PUBLIC_IP")
+		// IP fixo ou "auto" (descoberta por interface → STUN → HTTPS; ver publicip.go)
+		publicIP := resolvedPublicIP(log)
 		udpPort, _ := strconv.Atoi(os.Getenv("WACALLS_UDP_PORT"))
-		if publicIP == "auto" {
-			publicIP = detectPublicIP()
-			if publicIP != "" {
-				log.Info("browser webrtc: auto-detected public IP", "ip", publicIP)
-			} else {
-				log.Warn("browser webrtc: could not auto-detect public IP")
-			}
-		}
 		if publicIP == "" || udpPort == 0 {
 			browserAPI = webrtc.NewAPI()
 			return
@@ -97,7 +76,14 @@ type Bridge struct {
 	// renegociação ou transferência): fechar a ponte antiga não deve encerrar a
 	// chamada, pois a nova ponte assume o mesmo leg.
 	terminateDisabled atomic.Bool
+	// OnICEState (opcional) recebe cada mudança de estado do ICE (log/diagnóstico).
+	OnICEState func(state string)
+	// connected marca que o ICE chegou a conectar ao menos uma vez.
+	connected atomic.Bool
 }
+
+// WasConnected diz se o ICE desta ponte chegou a conectar.
+func (b *Bridge) WasConnected() bool { return b.connected.Load() }
 
 // DisableTerminate impede que o fechamento desta ponte dispare OnTerminalICE.
 func (b *Bridge) DisableTerminate() { b.terminateDisabled.Store(true) }
@@ -156,6 +142,12 @@ func NewBridge(offerSDP string, log *slog.Logger) (*Bridge, string, error) {
 
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
 		log.Debug("browser ice state", "state", s.String())
+		if s == webrtc.ICEConnectionStateConnected {
+			br.connected.Store(true)
+		}
+		if br.OnICEState != nil {
+			br.OnICEState(s.String())
+		}
 		if s == webrtc.ICEConnectionStateFailed || s == webrtc.ICEConnectionStateClosed {
 			if br.OnTerminalICE != nil && !br.terminateDisabled.Load() {
 				br.OnTerminalICE()

@@ -2,6 +2,175 @@
 
 Todas as mudanças relevantes do AstraCalls.
 
+## v1.1.3 — 2026-10-23
+
+A versão da **telefonia SIP** e dos **webhooks múltiplos**: o PABX passa a falar com o
+WhatsApp nos dois sentidos com áudio limpo, a chamada SIP pode ser atendida pelo agente de
+voz (IA) e transferida para um atendente, e cada sessão aceita vários webhooks com filtros
+próprios, configuráveis pelo painel. Também traz a cobrança Pix nativa, status de grupo,
+catálogo, Meta AI e "marcar todos" nos grupos, além de **prevenção de bloqueio**: consulta
+do limite de conversas novas do WhatsApp, aparelho vinculado discreto e menos consultas ao
+WhatsApp.
+
+### 🔗 Webhooks
+
+- **Vários webhooks por sessão** (até 10), cada um com URL, secret, filtro de eventos e
+  "ignorar grupos" próprios. Rotas `GET/POST /webhooks`, `PUT/DELETE /webhooks/{wid}` e
+  `POST /webhooks/{wid}/test` (envia um evento `test` e devolve o HTTP recebido).
+- **Ignorar grupos** (`ignoreGroups`): não entrega nenhum evento de conversa de grupo
+  (mensagens, confirmações, reações, participantes).
+- **Entrega independente:** um webhook fora do ar não trava os outros (circuito por
+  webhook); a fila de falhas (DLQ) informa o `webhookId` e o reativar aceita `?webhookId=`.
+- **Painel:** botão **Webhook** em toda sessão, com lista, adicionar, editar, remover,
+  testar e reativar.
+- A rota antiga `/webhook` continua igual e opera no webhook principal (`default`).
+
+### ☎️ Telefonia SIP (PABX ↔ WhatsApp)
+
+- **Modo agente:** a ligação que chega no ramal SIP vira uma chamada recebida comum
+  (evento `incoming` com `source: "sip"`), atendida pelo agente de voz via WS pcm16, com
+  DTMF e barge-in (`{"type":"clear"}`). Configuração por sessão em `/sip-agent`
+  (`originate`, `agent` ou `auto`) e seletor no painel.
+- **Transferência para atendente:** `/transfer`, `/pickup`, `/hold` e `/resume` valem para
+  chamadas SIP. A IA solta a ligação, o cliente ouve música de espera e o atendente assume
+  por WebRTC ou WS. Se o WebRTC do atendente não conectar, a chamada volta para a espera
+  em vez de cair.
+- **Conector SIP (`sipconnector`):** serviço separado na mesma imagem que liga qualquer
+  PABX IP ao AstraChat com a mesma API de chamadas — linhas por caixa, ramal por
+  atendente, entrada e saída, WebRTC PCMU, IA pelo WS, transferência por REFER e ID de
+  autenticação separado do ramal (3CX).
+- Registro estável no PABX: CSeq crescente, keep-alive, renovação no prazo concedido e
+  binding listado no 200 do REGISTER (3CX).
+
+### 💸 Mensagens e grupos
+
+- **Cobrança Pix nativa:** `/messages/pix` com `style: "charge"` envia o cartão de cobrança
+  do WhatsApp com itens, total e botão Pagar.
+- **Status do grupo:** `POST /groups/{gid}/status` (texto com cor ou imagem).
+- **Catálogo:** `POST /messages/catalog` e botão `cta_catalog` no carrossel e no interativo.
+- **Meta AI:** `POST /meta-ai` pergunta à Meta AI pela conta conectada, com resposta
+  opcional no chat. Depende de a conta ter a Meta AI liberada no celular.
+- **Marcar todos:** `mentionAll: true` (ou `mentions: ["all"]`) marca o grupo inteiro sem
+  listar nomes; `@todos`/`@everyone` no texto (API ou Chatwoot) também funciona.
+
+### 🛡️ Prevenção de bloqueio
+
+- **Limite de conversas novas (message capping):** `GET /sessions/{sid}/capping` mostra a
+  cota de conversas novas do ciclo, quanto já foi usado, quando renova e o status
+  (`NONE`, `FIRST_WARNING`, `SECOND_WARNING`, `CAPPED`). Também aparece no
+  `restriction-status`. Mudança de status dispara o webhook `message_capping` e, em aviso
+  ou travado, um alerta no Chatwoot.
+- **Aparelho vinculado discreto:** o dispositivo deixa de aparecer como "whatsmeow" em
+  Dispositivos conectados e passa a se apresentar como WhatsApp Web (Chrome/Windows).
+  Configurável por `WACALLS_DEVICE_NAME` e `WACALLS_DEVICE_BROWSER`; vale para pareamentos novos.
+- **Menos consultas ao WhatsApp:** a foto de perfil do contato/grupo fica em cache por
+  6 h (inclusive "sem foto"/"foto escondida"), em vez de ser consultada a cada mensagem.
+
+### 🐞 Correções
+
+- **SIP — sem áudio do PABX:** na chamada WhatsApp → ramal o áudio do PABX era descartado
+  e o cliente do WhatsApp não ouvia o atendente.
+- **SIP — "ring" ao fundo no ramal:** o áudio para o PABX saía em rajadas irregulares;
+  agora sai ritmado em 20 ms nas duas direções.
+- **SIP — autenticação:** o INVITE para o ramal no PABX responde ao desafio 401/407;
+  INVITE de IP diferente do REGISTER exige senha; sessão certa com vários ramais no mesmo
+  PABX; BYE conferido pelo diálogo; proxy de saída como próximo salto.
+- **SIP — chamada de saída do PABX** usa diálogo correto (To-tag, Contact, ACK, BYE), caller
+  ID com o telefone em vez do LID, e o PABX para de tocar quando outro cliente atende.
+- **Nota de voz no iPhone:** áudio enviado pela API/Chatwoot parava de tocar no iPhone;
+  agora sobe como nota de voz (ptt), igual ao celular.
+- **Chamada fantasma:** erro interno ao receber uma ligação não deixa mais a chamada presa
+  ocupando vaga do limite.
+- **Encerrar/recusar chamada** com nova tentativa quando a conexão está reconectando (o
+  outro lado ficava tocando).
+- **Presença após parear:** reenviada com o nome real assim que a sincronização termina.
+- **Ticket vazio com o próprio número no Chatwoot:** mensagens internas do celular da
+  conta (resposta a pedido de reenvio, chaves, sync após parear) abriam conversa sem
+  conteúdo. Agora são ignoradas e nenhuma conversa é aberta sem algo a postar.
+
+## v1.1.2 — 2026-10-15
+
+A versão dos **formulários nativos do WhatsApp Business**, das **comunidades** e da
+**supervisão de chamadas**: espiar a ligação em tempo real, ajustar o volume e silenciar o
+toque. Também traz o compartilhamento do histórico do grupo, a descoberta automática do IP
+público e uma revisão completa da API contra a documentação (Swagger), com correções de
+identidade (telefone × LID).
+
+### 📋 Formulários nativos do WhatsApp Business
+
+- `POST /messages/native-form` `{ to, flowId, body?, cta?, data? }`: envia o **formulário
+  nativo** criado no app Business (Ferramentas comerciais → Formulários). Abre dentro do
+  WhatsApp do cliente, sem link externo. Pela API dá para controlar o texto, o botão e
+  quais campos do modelo aparecem.
+- **Resposta capturada:** quando o cliente envia, a resposta vira texto legível
+  ("📋 Formulário respondido — Nome: …") no Chatwoot e dispara o webhook `form_response`
+  com `source: "native"` e todos os campos.
+- `GET /native-forms`: lista os formulários da conta com o **ID** de cada um.
+- **Painel:** botão **Formulários** na sessão abre um pop-up com os formulários, o ID
+  pronto para copiar e um exemplo de envio.
+- Observação: o formulário precisa ser criado pela **mesma conta** que envia, e só
+  aparece na lista depois de enviado uma vez pelo celular (o WhatsApp não sincroniza a
+  lista com aparelhos vinculados). Funciona só em conversa individual.
+
+### 🏘️ Comunidades
+
+- `POST /communities`: cria a comunidade (o grupo de avisos vem junto).
+- `GET /communities` e `GET /communities/{cid}`: lista as comunidades e mostra os grupos
+  de cada uma.
+- `POST /communities/{cid}/groups`: cria um grupo já dentro da comunidade.
+- `POST /communities/{cid}/groups/link` e `/unlink`: vincula ou desvincula grupos
+  existentes (resultado por grupo, conferido com o WhatsApp).
+- `GET /communities/{cid}/participants` e `POST /communities/{cid}/participants/add`:
+  membros de toda a comunidade e adição de novos membros.
+- Os grupos passam a informar `isCommunity`, `parentJid` e `isAnnouncementGroup`.
+
+### 🎧 Supervisão de chamadas
+
+- **Espiar a chamada:** `POST /calls/{id}/spy` (WebRTC só de escuta) ou
+  `GET /calls/{id}/spy/ws` (PCM16). O supervisor ouve os dois lados em tempo real, sem
+  entrar na ligação. Evento SSE `call-action` `kind=spy`.
+- **Volume:** `POST /calls/{id}/volume` `{ level 0..3 | percent }` ajusta o volume do
+  cliente no servidor (vale para WebRTC, WebSocket e SIP).
+- **Silenciar o toque:** `POST /calls/{id}/silence` silencia o toque do pop-up sem
+  recusar a chamada.
+- **Widget do Chatwoot:** botão de silenciar o toque, controle de volume (0–200%) e aviso
+  "Supervisor ouvindo".
+
+### 👥 Grupos
+
+- **Compartilhar histórico com quem entrou:** `POST /groups/{gid}/history/share` ou
+  `shareHistory` no add de participantes. Depende de o WhatsApp liberar o recurso para a
+  conta; quando ele recusa, a API devolve 409 com o motivo.
+- Adicionar, remover, promover, rebaixar e aprovar pedido agora aceitam o número **com
+  ou sem o 9º dígito**.
+
+### 🌐 Rede
+
+- `WACALLS_PUBLIC_IP=auto` passa a descobrir o **IP público real** da VPS (interface,
+  STUN e serviços HTTPS, nessa ordem). Não é mais preciso fixar o IP à mão. O
+  `GET /api/config` mostra `publicIp` e `publicIpSource`.
+
+### 🛠️ Correções
+
+- **Telefone em vez de LID:** `/contacts/check`, `/contacts`, `/contacts/{jid}`,
+  participantes de grupo (`id`, `pn`) e dono do grupo (`owner`) voltam a trazer o
+  telefone. O LID vem num campo próprio (`lid`, `ownerLid`).
+- **Envio que "sumia":** número brasileiro de 13 dígitos com mapeamento antigo saía sem
+  chegar ao destinatário, mesmo com a API dizendo sucesso. Agora o número é conferido no
+  WhatsApp antes do envio.
+- `/contacts/{jid}` com número de 13 dígitos não dá mais 404.
+- `/profile/qr` devolve o link completo (`https://wa.me/qr/...`) e o `code`.
+- `PUT /privacy` e `/privacy/status` respondem no mesmo formato (camelCase) do
+  `GET /privacy`.
+- `POST /chatwoot` não devolve mais o token da conta na resposta.
+- `POST /calls` aceita `duration_ms` como texto (n8n).
+
+### 📚 Documentação (Swagger)
+
+- Revisão completa: **todas as 179 rotas** conferidas contra o código, com schemas de
+  resposta, campos e erros que faltavam. Rotas novas documentadas, incluindo
+  `messages/event`, `calls/{id}/mute`, `calls/{id}/hand` e as de widget.
+
 ## v1.1.1 — 2026-10-09
 
 A versão da **chamada em GRUPO**: ligar para um grupo do WhatsApp (áudio e vídeo) pelo

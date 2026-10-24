@@ -271,6 +271,12 @@ func (s *Session) chatwootPushIncoming(evt *events.Message) {
 	if !cfg.valid() {
 		return
 	}
+	// Mensagem interna do protocolo (o celular da própria conta responde a
+	// pedido de reenvio, compartilha chaves, avisa sync de histórico): não é
+	// conversa. A edição também vem como ProtocolMessage e segue normal.
+	if pm := evt.Message.GetProtocolMessage(); pm != nil && pm.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return
+	}
 	if evt.Info.IsFromMe {
 		if !s.shouldMirrorOwn(evt.Info.ID, cfg) {
 			return
@@ -314,10 +320,7 @@ func (s *Session) chatwootMirrorOwn(cfg ChatwootConfig, evt *events.Message) {
 	if name == "" {
 		name = chat.User
 	}
-	avatar := ""
-	if pp, perr := s.client.GetProfilePictureInfo(context.Background(), chat, nil); perr == nil && pp != nil {
-		avatar = pp.URL
-	}
+	avatar := s.cachedAvatar(chat)
 	j := deliverContent(evt, mirrorDeviceTitle, true)
 	j.ChatID = chatID
 	j.Phone = phone
@@ -339,10 +342,7 @@ func (s *Session) chatwootPushDirect(cfg ChatwootConfig, evt *events.Message) {
 			name = chat.User
 		}
 	}
-	avatar := ""
-	if pp, perr := s.client.GetProfilePictureInfo(context.Background(), evt.Info.Chat, nil); perr == nil && pp != nil {
-		avatar = pp.URL
-	}
+	avatar := s.cachedAvatar(evt.Info.Chat)
 	j := deliverContent(evt, "", false)
 	j.ChatID = chatID
 	j.Phone = phone
@@ -437,9 +437,7 @@ func (s *Session) groupJobTarget(group types.JID) (chatID, name, avatar string) 
 	if gi, err := s.client.GetGroupInfo(context.Background(), group); err == nil && gi.Name != "" {
 		name = gi.Name
 	}
-	if pp, perr := s.client.GetProfilePictureInfo(context.Background(), group, nil); perr == nil && pp != nil {
-		avatar = pp.URL
-	}
+	avatar = s.cachedAvatar(group)
 	return
 }
 
@@ -575,6 +573,11 @@ func (s *Session) chatwootSend(cfg ChatwootConfig, j cwJob) {
 // unidade retryável: qualquer passo que fale com o Chatwoot pode falhar aqui e o
 // job volta pra fila. Só re-baixa mídia do WhatsApp quando o job carrega uma.
 func (s *Session) execChatwootJob(cfg ChatwootConfig, j cwJob) error {
+	// Nada a postar (mensagem de protocolo, tipo sem texto): não abre contato
+	// nem conversa — senão o Chatwoot ganha um ticket vazio.
+	if strings.TrimSpace(j.Text) == "" && !j.hasMedia() && formatReferralNote(j.Referral) == "" {
+		return nil
+	}
 	contactID, sourceID, err := cfg.ensureContact(j.ChatID, j.Phone, j.Name, j.Avatar, j.AltID)
 	if err != nil {
 		return fmt.Errorf("ensure contact: %w", err)
@@ -1033,11 +1036,20 @@ func (s *server) handleChatwootWebhook(w http.ResponseWriter, r *http.Request) {
 	// GRUPO: "@5561..." no texto vira menção de verdade (contextInfo.mentionedJid);
 	// o corpo do webhook do Chatwoot não tem como informar isso.
 	if jid.Server == types.GroupServer {
-		if m := sess.mentionTargets(ctx, detectMentions(content)); len(m) > 0 {
+		// "@todos"/"@all" marca o grupo inteiro
+		ms := sess.autoMentions(ctx, jid.String(), content, nil)
+		if m := sess.mentionTargets(ctx, ms); len(m) > 0 {
 			if quote == nil {
 				quote = &waE2E.ContextInfo{}
 			}
 			quote.MentionedJID = m
+		}
+		if hasMentionAll(ms) {
+			if quote == nil {
+				quote = &waE2E.ContextInfo{}
+			}
+			quote.NonJIDMentions = proto.Uint32(quote.GetNonJIDMentions() | 1)
+			content = mentionAllText(content)
 		}
 	}
 
@@ -1229,14 +1241,15 @@ func (s *Session) sendChatwootFile(ctx context.Context, jid types.JID, fileType,
 		if terr != nil {
 			ogg = data // fallback: envia o original
 		}
-		up, e := s.client.Upload(ctx, ogg, whatsmeow.MediaAudio)
+		up, e := s.uploadVoiceNote(ctx, ogg)
 		if e != nil {
 			return "", e
 		}
 		am := &waE2E.AudioMessage{
 			Mimetype: proto.String("audio/ogg; codecs=opus"), PTT: proto.Bool(true),
 			URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
-			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			MediaKeyTimestamp: proto.Int64(time.Now().Unix()),
+			FileEncSHA256:     up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
 			ContextInfo: quote,
 		}
 		if terr == nil {
@@ -1471,6 +1484,7 @@ func (s *server) handleSetChatwoot(w http.ResponseWriter, r *http.Request) {
 	sess.setChatwoot(cfg)
 	b, _ := json.Marshal(cfg)
 	_ = sess.mgr.store.setChatwoot(r.Context(), sess.id, string(b))
+	cfg.AccountToken = "" // não devolve o token (mesma regra do GET)
 	writeJSON(w, http.StatusOK, map[string]any{"chatwoot": cfg})
 }
 

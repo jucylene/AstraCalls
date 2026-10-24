@@ -181,13 +181,14 @@ func (s *server) handleSendText(w http.ResponseWriter, r *http.Request) {
 		Participant     string   `json:"participant"`     // em grupo: quem mandou a citada
 		FromMe          bool     `json:"fromMe"`          // a citada é nossa
 		Mentions        []string `json:"mentions"`        // JIDs/números a mencionar (@)
+		MentionAll      bool     `json:"mentionAll"`      // marca todos do grupo (fantasma: sem @ no texto)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil || strings.TrimSpace(b.Text) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to and text required"})
 		return
 	}
 	msg := &waE2E.Message{Conversation: proto.String(b.Text)}
-	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Text, b.Mentions)))
+	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Text, withMentionAll(b.Mentions, b.MentionAll))))
 	s.send(sess, w, r, b.To, msg)
 }
 
@@ -201,6 +202,7 @@ func (s *server) handleSendImage(w http.ResponseWriter, r *http.Request) {
 		QuotedMessageID, Participant       string
 		FromMe                             bool
 		Mentions                           []string
+		MentionAll                         bool `json:"mentionAll"` // marca todos do grupo (fantasma: sem @ no texto)
 	}
 	_ = json.NewDecoder(r.Body).Decode(&b)
 	up, ok := s.uploadMedia(sess, w, r, b.Base64, b.URL, whatsmeow.MediaImage)
@@ -216,7 +218,7 @@ func (s *server) handleSendImage(w http.ResponseWriter, r *http.Request) {
 		URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 		FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
 	}}
-	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Caption, b.Mentions)))
+	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Caption, withMentionAll(b.Mentions, b.MentionAll))))
 	s.send(sess, w, r, b.To, msg)
 }
 
@@ -233,6 +235,7 @@ func (s *server) handleSendAudio(w http.ResponseWriter, r *http.Request) {
 		QuotedMessageID, Participant string
 		FromMe                       bool
 		Mentions                     []string
+		MentionAll                   bool `json:"mentionAll"` // marca todos do grupo (fantasma: sem @ no texto)
 	}
 	_ = json.NewDecoder(r.Body).Decode(&b)
 	// Buscamos os bytes primeiro (em vez de uploadMedia) p/ poder estimar a duração
@@ -242,7 +245,12 @@ func (s *server) handleSendAudio(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	up, err := sess.client.Upload(r.Context(), data, whatsmeow.MediaAudio)
+	var up whatsmeow.UploadResponse
+	if b.PTT {
+		up, err = sess.uploadVoiceNote(r.Context(), data) // nota de voz: caminho ptt, igual ao celular
+	} else {
+		up, err = sess.client.Upload(r.Context(), data, whatsmeow.MediaAudio)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -255,6 +263,7 @@ func (s *server) handleSendAudio(w http.ResponseWriter, r *http.Request) {
 		Mimetype: proto.String(mime), PTT: proto.Bool(b.PTT),
 		URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 		FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+		MediaKeyTimestamp: proto.Int64(time.Now().Unix()),
 	}
 	// Duração: usa a informada; senão (nota de voz) estima pelo OGG/Opus.
 	secs := uint32(0)
@@ -274,7 +283,7 @@ func (s *server) handleSendAudio(w http.ResponseWriter, r *http.Request) {
 		am.Waveform = synthWaveform()
 	}
 	msg := &waE2E.Message{AudioMessage: am}
-	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, b.Mentions))
+	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, "", withMentionAll(b.Mentions, b.MentionAll))))
 	s.send(sess, w, r, b.To, msg)
 }
 
@@ -288,6 +297,7 @@ func (s *server) handleSendVideo(w http.ResponseWriter, r *http.Request) {
 		QuotedMessageID, Participant       string
 		FromMe                             bool
 		Mentions                           []string
+		MentionAll                         bool `json:"mentionAll"` // marca todos do grupo (fantasma: sem @ no texto)
 	}
 	_ = json.NewDecoder(r.Body).Decode(&b)
 	up, ok := s.uploadMedia(sess, w, r, b.Base64, b.URL, whatsmeow.MediaVideo)
@@ -303,7 +313,7 @@ func (s *server) handleSendVideo(w http.ResponseWriter, r *http.Request) {
 		URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 		FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
 	}}
-	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Caption, b.Mentions)))
+	applyContextInfo(msg, sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Caption, withMentionAll(b.Mentions, b.MentionAll))))
 	s.send(sess, w, r, b.To, msg)
 }
 
@@ -362,6 +372,7 @@ func (s *server) handleSendDocument(w http.ResponseWriter, r *http.Request) {
 		QuotedMessageID, Participant                 string
 		FromMe                                       bool
 		Mentions                                     []string
+		MentionAll                                   bool `json:"mentionAll"` // marca todos do grupo (fantasma: sem @ no texto)
 	}
 	_ = json.NewDecoder(r.Body).Decode(&b)
 	up, ok := s.uploadMedia(sess, w, r, b.Base64, b.URL, whatsmeow.MediaDocument)
@@ -386,7 +397,7 @@ func (s *server) handleSendDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	// citação/menção vão no ContextInfo do documento interno (o wrapper de legenda
 	// só embrulha essa mesma mensagem).
-	doc.ContextInfo = sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Caption, b.Mentions))
+	doc.ContextInfo = sess.buildSendContext(r.Context(), b.QuotedMessageID, b.Participant, b.FromMe, sess.autoMentions(r.Context(), b.To, b.Caption, withMentionAll(b.Mentions, b.MentionAll)))
 	s.send(sess, w, r, b.To, documentWithCaption(doc, b.Caption))
 }
 
@@ -433,6 +444,9 @@ func splitEvents(csv string) []string {
 	return out
 }
 
+// Rotas legadas de 1 webhook por sessão: operam só no webhook "default" da
+// lista (ver webhooks.go). Os demais webhooks da sessão não são afetados.
+
 func (s *server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 	sess := s.sessionByID(w, r.PathValue("sid"))
 	if sess == nil {
@@ -440,26 +454,51 @@ func (s *server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	var b struct {
 		URL    string   `json:"url"`
-		Secret string   `json:"secret"` // opcional: assina o payload (X-Webhook-Signature: sha256=…)
+		Secret *string  `json:"secret"` // opcional: assina o payload (X-Webhook-Signature: sha256=…); ausente = mantém o atual
 		Events []string `json:"events"` // opcional: só entrega estes tipos; vazio = todos
+		// IgnoreGroups: não entrega eventos de grupo; ausente = mantém o atual.
+		IgnoreGroups *bool `json:"ignoreGroups"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url required"})
 		return
 	}
 	url := strings.TrimSpace(b.URL)
-	secret := strings.TrimSpace(b.Secret)
-	events := make([]string, 0, len(b.Events))
-	for _, e := range b.Events {
-		if e = strings.TrimSpace(e); e != "" {
-			events = append(events, e)
+	var def WebhookTarget
+	err := sess.updateWebhooks(r.Context(), func(list []WebhookTarget) ([]WebhookTarget, error) {
+		idx := -1
+		for i := range list {
+			if list[i].ID == webhookDefaultID {
+				idx = i
+			}
 		}
-	}
-	sess.setWebhook(url, secret, events)
-	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, url, secret, strings.Join(events, ","))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"webhook": url, "hasSecret": secret != "", "events": events,
+		if url == "" { // vazio = remove (igual ao DELETE)
+			if idx >= 0 {
+				list = append(list[:idx:idx], list[idx+1:]...)
+			}
+			return list, nil
+		}
+		if idx < 0 {
+			list = append([]WebhookTarget{{ID: webhookDefaultID}}, list...)
+			idx = 0
+		}
+		t := &list[idx]
+		t.URL = url
+		t.Events = cleanEvents(b.Events)
+		if b.Secret != nil {
+			t.Secret = strings.TrimSpace(*b.Secret)
+		}
+		if b.IgnoreGroups != nil {
+			t.IgnoreGroups = *b.IgnoreGroups
+		}
+		def = *t
+		return list, nil
 	})
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, legacyWebhookView(def))
 }
 
 func (s *server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
@@ -467,10 +506,19 @@ func (s *server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	// não devolve o secret em claro; só indica se está configurado.
-	writeJSON(w, http.StatusOK, map[string]any{
-		"webhook": sess.getWebhook(), "hasSecret": sess.getWebhookSecret() != "", "events": sess.getWebhookEvents(),
-	})
+	def, _ := sess.webhookByID(webhookDefaultID)
+	writeJSON(w, http.StatusOK, legacyWebhookView(def))
+}
+
+// legacyWebhookView é o formato antigo da rota /webhook (não devolve o secret).
+func legacyWebhookView(t WebhookTarget) map[string]any {
+	ev := t.Events
+	if ev == nil {
+		ev = []string{}
+	}
+	return map[string]any{
+		"webhook": t.URL, "hasSecret": t.Secret != "", "events": ev, "ignoreGroups": t.IgnoreGroups,
+	}
 }
 
 func (s *server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
@@ -478,7 +526,14 @@ func (s *server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	sess.setWebhook("", "", nil)
-	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, "", "", "")
+	_ = sess.updateWebhooks(r.Context(), func(list []WebhookTarget) ([]WebhookTarget, error) {
+		for i := range list {
+			if list[i].ID == webhookDefaultID {
+				return append(list[:i:i], list[i+1:]...), nil
+			}
+		}
+		return list, nil
+	})
+	whDeliver.forget(sess.id, webhookDefaultID)
 	w.WriteHeader(http.StatusNoContent)
 }

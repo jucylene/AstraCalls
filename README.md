@@ -12,9 +12,10 @@ VoIP nativo (áudio + vídeo, 1:1 e em grupo), gateway **SIP/PBX**, suíte compl
 [![pion](https://img.shields.io/badge/pion-WebRTC-FF6B6B)](https://github.com/pion/webrtc)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![Docker](https://img.shields.io/badge/Docker-amd64%20%2B%20arm64-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/astraonline/astracalls)
+[![n8n](https://img.shields.io/npm/v/n8n-nodes-astracalls?label=n8n%20node&logo=n8n&color=EA4B71)](https://www.npmjs.com/package/n8n-nodes-astracalls)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](#-licença)
 
-[Visão Geral](#-visão-geral) · [Funcionalidades](#-funcionalidades) · [Arquitetura](#-arquitetura) · [Início Rápido](#-início-rápido) · [Configuração](#-configuração) · [Deploy](#-deploy-em-produção-docker-swarm--traefik) · [API](#-api) · [Suporte](#️-suporte-profissional)
+[Visão Geral](#-visão-geral) · [Funcionalidades](#-funcionalidades) · [Arquitetura](#-arquitetura) · [Início Rápido](#-início-rápido) · [Configuração](#-configuração) · [Deploy](#-deploy-em-produção-docker-swarm--traefik) · [API](#-api) · [n8n](#-integração-com-n8n) · [Suporte](#️-suporte-profissional)
 
 </div>
 
@@ -93,6 +94,15 @@ roteadas por call ID.
   hospedado), com **servidor, domínio e outbound proxy** separados, re-REGISTER automático
   e status no painel.
 - RTP em **faixa fixa de portas** (`WACALLS_RTP_PORT_MIN/MAX`), publicável em `mode=host`.
+
+### 📞 Conector SIP (PABX IP → AstraChat) — serviço separado
+- Binário `sipconnector` na mesma imagem: liga **qualquer PABX IP** ao AstraChat, sem WhatsApp.
+- Linha por caixa (o PABX registra no conector **ou** o conector registra no PABX) e **um
+  ramal por atendente** (e-mail → ramal).
+- Expõe a **mesma API de chamadas do wacalls** (SSE, accept/reject/DELETE, `/webrtc` para o
+  navegador em PCMU sem transcodificar, `/ws` pcm16 para o agente de voz por IA) e
+  transferência para ramal por **SIP REFER**.
+- Detalhes, variáveis e deploy: [`cmd/sipconnector/README.md`](cmd/sipconnector/README.md).
 
 ### 💬 Mensagens (API estilo WAHA, ~60 endpoints)
 - **Envio:** texto, imagem, áudio/nota de voz (com waveform), vídeo, **nota de vídeo (PTV)**,
@@ -260,11 +270,13 @@ npm run dev      # Vite na :5173, faz proxy de /api → http://localhost:8080
 | `WACALLS_PG_URL` | — | URL de manutenção do Postgres (usuário com `CREATEDB`) |
 | `WACALLS_PG_NAMESPACE` | `wacalls` | Prefixo dos bancos (`wacalls_main` + `wacalls_<id>`) |
 | `WACALLS_API_KEY` | — | Se setada, exige `X-API-Key` em `/api/*` (**use em produção**) |
-| `WACALLS_PUBLIC_IP` | — | IP público p/ NAT 1:1 / ICE-TCP / SDP do SIP (`auto` detecta) |
+| `WACALLS_PUBLIC_IP` | — | IP público p/ NAT 1:1 / ICE-TCP / SDP do SIP. `auto` descobre o IP real mesmo dentro do Docker/NAT de nuvem (interface pública → STUN → HTTPS); o IP achado e a fonte aparecem em `GET /api/config` (`publicIp`, `publicIpSource`) |
 | `WACALLS_UDP_PORT` | — | Porta de mídia WebRTC (UDP + ICE-TCP) |
 | `WACALLS_DEFAULT_TRANSPORT` | `auto` | Transporte de áudio do navegador: `auto` (WebRTC → fallback WS), `webrtc`, `websocket` |
 | `WACALLS_MAX_CALLS` | `8` | Equivalente a `-max-calls-per-session` |
 | `WACALLS_RING_TIMEOUT_SECONDS` | — | Expira chamada recebida que nunca é encerrada |
+| `WACALLS_DEVICE_NAME` | `Windows` | Nome do aparelho em "Dispositivos conectados" (vale para pareamentos novos) |
+| `WACALLS_DEVICE_BROWSER` | `chrome` | Ícone/plataforma do aparelho: `chrome`, `edge`, `firefox`, `safari` ou `desktop` |
 | `WACALLS_RECORDING_DIR` | `$TMPDIR/wacalls-recordings` | Onde ficam os MP3s (retenção ~48h) |
 | `WACALLS_PUBLIC_BASE_URL` | — | Base pública p/ URLs de gravação, formulários e widget (ex.: `https://call.seudominio.com`) |
 | `WACALLS_WIDGET_KEY` | — | Chave-mestra para emitir tokens de widget (`POST /api/widget-tokens`) |
@@ -314,7 +326,7 @@ Notas de produção:
 
 ## 🔌 API
 
-A documentação completa (OpenAPI 3, **140 rotas**) é servida pelo próprio servidor em
+A documentação completa (OpenAPI 3, **179 rotas**) é servida pelo próprio servidor em
 **`/api-docs.html`** (Swagger UI) e está em [`client/public/openapi.yaml`](./client/public/openapi.yaml).
 
 Todas as rotas são escopadas por sessão (`/api/sessions/{sid}/…`). Os eventos chegam por um
@@ -324,18 +336,37 @@ Todas as rotas são escopadas por sessão (`/api/sessions/{sid}/…`). Os evento
 | Área | Rotas (resumo) |
 |---|---|
 | **Sessões** | `GET/POST /api/sessions`, `DELETE /{sid}`, `/logout`, `/pair`, `/pair-code`, `/pair-passkey`, `/proxy`, `/recording`, `/restriction-status` |
-| **Chamadas** | `POST /calls` (`{phone, video?, record?}`), `/calls/{id}/webrtc` (SDP), `GET /calls/{id}/ws` (PCM16), `/accept`, `/reject`, `DELETE /calls/{id}`, `/hold`, `/resume`, `/pickup`, `/transfer`, `/mute`, `/hand`, `/video/{request\|accept\|reject\|stop}`, `POST /calls/fake`, `GET /calls`, `GET /history` |
+| **Chamadas** | `POST /calls` (`{phone, video?, record?}`), `/calls/{id}/webrtc` (SDP), `GET /calls/{id}/ws` (PCM16), `/accept`, `/reject`, `DELETE /calls/{id}`, `/hold`, `/resume`, `/pickup`, `/transfer`, `/mute`, `/hand`, `/video/{request\|accept\|reject\|stop}`, `/spy` (espiar: WebRTC recvonly / `GET /spy/ws` PCM16), `/volume` (ganho 0..3), `/silence` (silenciar o toque só na tela), `POST /calls/fake`, `GET /calls`, `GET /history` |
 | **Grupo** | `POST /calls/group`, `POST /calls/group/end`, `GET /calls/group/ws`, `GET /calls/group/video-ws`, `GET /calls/group/roster` |
 | **Disparos** | `POST /broadcast` (ligações, áudio/vídeo), `POST /blast` + `GET /blasts`, `/blasts/{id}`, `/blasts/{id}/cancel` |
 | **Mensagens** | `POST /messages/{text\|image\|audio\|video\|ptv\|document\|sticker\|contact\|location\|link-preview\|poll\|poll-vote\|event\|event-response\|pix\|product\|product-native\|interactive\|buttons\|list\|carousel\|form\|disappearing\|seen\|typing\|forward}`, `PUT /messages/{edit\|react}`, `GET /messages`, `/messages/search`, `/messages/{id}/media`, `/messages/new-message-id`, `DELETE /messages`, `/schedule` |
 | **Status / presença** | `POST /status/{text\|image\|video\|audio}`, `POST /presence`, `/presence/{jid}/subscribe` |
-| **Contatos / grupos / canais** | `GET /contacts`, `/contacts/check`, `/contacts/{jid}`, `/picture`, `/business`, `/block`, `/unblock`, `GET /blocklist`; `GET/POST /groups`, `/groups/{gid}/…` (participantes, convite, pedidos, configurações, foto, assunto, descrição, sair); `GET /channels`, `/channels/{id}/…` (seguir, mutar, mensagens) |
+| **Contatos / grupos / canais** | `GET /contacts`, `/contacts/check`, `/contacts/{jid}`, `/picture`, `/business`, `/block`, `/unblock`, `GET /blocklist`; `GET/POST /groups`, `/groups/{gid}/…` (participantes, convite, pedidos, configurações, foto, assunto, descrição, sair; `POST /groups/{gid}/history/share` e `shareHistory` no add: compartilhar o histórico recente com quem entrou); `GET/POST /communities`, `/communities/{cid}` (+ grupos), `/communities/{cid}/groups` (listar/criar), `/groups/link`, `/groups/unlink`, `/participants` (+ `/participants/add`); `GET /channels`, `/channels/{id}/…` (seguir, mutar, mensagens) |
 | **Chats / perfil / privacidade** | `GET /chats`, `/chats/{chatId}/messages`, `PUT /chats/{chatId}/disappearing`, `PUT /disappearing`; `GET /profile`, `/profile/qr`, `PUT /profile/status`; `GET/PUT /privacy`, `GET /privacy/status` |
 | **Webhooks** | `GET/POST/DELETE /webhook` (eventos, `secret` HMAC), `GET /webhooks/status`, `/webhooks/dlq`, `POST /webhooks/dlq/{id}/replay`, `/webhooks/reenable` |
 | **Chatwoot** | `GET/POST/DELETE /chatwoot`, `POST /chatwoot/webhook`, `/chatwoot/import-history`, `/chatwoot/groups/{gid}/open`, `/chatwoot/channels/{id}/open`, `GET /api/chatwoot/resolve` |
 | **SIP** | `GET /api/sip/status`, `GET/POST /sip` (credenciais p/ o PBX registrar aqui), `GET/POST /sip-ext` (registrar num PBX externo: host, porta, usuário, senha, ramal, proxy) |
 | **Widget / formulários** | `GET /api/widget-key`, `POST /api/widget-tokens`, `GET /forms/{token}`, `POST /forms/{token}/submit` (públicas, token como capability) |
 | **Infra** | `GET /api/config` (flags, versão, commit), `GET /livez`, `/readyz`, `/metrics`, `GET /recordings/{id}` |
+
+---
+
+## 🔗 Integração com n8n
+
+Automatize o WhatsApp no **n8n sem escrever código**: o node oficial [`n8n-nodes-astracalls`](https://www.npmjs.com/package/n8n-nodes-astracalls) já está publicado no npm, todo em português.
+
+**Instalação:** no n8n, abra **Configurações → Community Nodes → Install**, digite `n8n-nodes-astracalls` e clique em **Install**. No Docker, use `N8N_COMMUNITY_PACKAGES=n8n-nodes-astracalls`.
+
+**Credencial:** a URL do seu AstraCalls e a API Key (`WACALLS_API_KEY`).
+
+| Node | O que faz |
+|---|---|
+| **AstraCalls** | 55 operações em 8 recursos: **Mensagem** (texto, mídia, documento, enquete, botões, lista, formulário nativo, reagir, editar, apagar…), **Chamada** (ligar, ligação fantasma, disparo de ligações com áudio/vídeo), **Grupo**, **Comunidade**, **Contato**, **Sessão**, **Formulário** e **Requisição Personalizada** (qualquer uma das 179 rotas) |
+| **AstraCalls Trigger** | Inicia o fluxo com 15 eventos: mensagem recebida, leitura, reação, voto em enquete, formulário respondido, entrada/saída de grupo, gravação de chamada, desconexão da sessão… Configura o webhook da sessão sozinho ao ativar |
+
+- **Fácil de usar:** a sessão é escolhida numa lista (nome + número), o destino aceita número com ou sem o 9º dígito e a mídia vem por URL ou de um arquivo de etapa anterior.
+- **Pronto para responder:** o gatilho entrega `de`, `nome`, `texto` e `responderPara` prontos para usar no envio, e ignora as mensagens da própria conta (sem loop).
+- **Agentes de IA:** o node pode ser usado como ferramenta pelos agentes de IA do n8n.
 
 ---
 
@@ -362,17 +393,6 @@ cd client && npm run build    # type-check + build de produção do painel
 
 ---
 
-## 🙏 Agradecimentos
-
-- [**whatsmeow**](https://github.com/tulir/whatsmeow) — biblioteca Go do protocolo WhatsApp Web
-- [**pion/webrtc**](https://github.com/pion/webrtc) — pilha WebRTC em Go puro (ICE + DTLS + SCTP)
-- [**opus_mlow**](https://github.com/edgardmessias/opus_mlow) — codec MLow nativo
-- [**meowcaller**](https://github.com/purpshell/meowcaller) — referência do motor de chamadas (inclusive **grupo**: epoch, relay SFU, SRTCP)
-- [**zapo**](https://github.com/w3nder/zapo) — referência da pilha de mídia (MediaClock, mute/raise hand)
-- [**sipgo**](https://github.com/emiago/sipgo) — pilha SIP em Go
-- [**WAHA**](https://github.com/devlikeapro/waha) — inspiração para o storage por sessão, a API de mensagens e a integração Chatwoot
-
----
 
 ## 🛠️ Suporte Profissional
 
