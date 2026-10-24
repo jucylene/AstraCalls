@@ -354,6 +354,7 @@ func (c *Call) hangup(reason string) {
 	c.mu.Lock()
 	srv, cli, cancel, status := c.srv, c.cli, c.cancelDial, c.status
 	c.mu.Unlock()
+	c.end(reason)
 	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
 	defer done()
 	switch {
@@ -366,7 +367,6 @@ func (c *Call) hangup(reason string) {
 	case cli != nil:
 		_ = cli.Bye(ctx)
 	}
-	c.end(reason)
 }
 
 // end é idempotente: libera tudo e avisa todo mundo.
