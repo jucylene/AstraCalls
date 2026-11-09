@@ -1059,6 +1059,7 @@ paths:
                   host: { type: string, description: "Domínio/host do PBX (vai na URI user@host)" }
                   port: { type: integer, example: 5060 }
                   user: { type: string }
+                  authUser: { type: string, description: "Usuário de autenticação (3CX: Authentication ID); vazio = usa user" }
                   pass: { type: string }
                   dest: { type: string, description: "Ramal/fila que toca quando chega chamada do WhatsApp (opcional)" }
                   proxy: { type: string, description: "Outbound proxy host[:porta] — p/ onde enviar REGISTER/INVITE; vazio = usa host" }
@@ -1086,6 +1087,7 @@ paths:
                 host: { type: string, example: "pbx.cliente.com" }
                 port: { type: integer, default: 5060 }
                 user: { type: string, example: "1001" }
+                authUser: { type: string, example: "aB3xY9kL", description: "Opcional. Usuário do digest quando difere do ramal (3CX: Authentication ID); ausente = mantém" }
                 pass: { type: string }
                 dest: { type: string, example: "600" }
                 proxy: { type: string, example: "sip.provedor.com:5060", description: "Outbound proxy (host[:porta]); vazio = usa host" }
@@ -1809,6 +1811,137 @@ paths:
                     items: { $ref: "#/components/schemas/CallRecord" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/sessions/{sid}/mcp-keys:
+    get:
+      tags: [Sessões]
+      summary: Lista as chaves MCP da sessão
+      description: Chaves que conectam agentes de IA a este número pelo MCP (`/mcp`). A chave em si nunca é devolvida, só o prefixo.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+                        prefix: { type: string, example: acmcp_3f9a1c }
+                        readOnly: { type: boolean }
+                        createdAt: { type: string, format: date-time }
+                        lastUsedAt: { type: string, format: date-time }
+                  max: { type: integer, example: 20 }
+                  endpoint: { type: string, example: "https://astracalls.exemplo.com/mcp" }
+    post:
+      tags: [Sessões]
+      summary: Cria uma chave MCP presa à sessão
+      description: >
+        Devolve a chave (`secret`) UMA única vez, junto com `endpoint` (usar com
+        `Authorization: Bearer <secret>`) e `url` (endereço completo com a chave, para
+        clientes que só aceitam URL). `readOnly` libera só as ferramentas de consulta. A
+        chave não alcança rotas de administração da conta (parear, desconectar, webhooks,
+        Chatwoot, SIP, proxy).
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: Claude do comercial }
+                readOnly: { type: boolean, default: false }
+      responses:
+        "201":
+          description: Criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: object }
+                  secret: { type: string, example: acmcp_3f9a1c... }
+                  endpoint: { type: string }
+                  url: { type: string }
+        "409":
+          description: Limite de 20 chaves por sessão
+  /api/sessions/{sid}/mcp-keys/{kid}:
+    delete:
+      tags: [Sessões]
+      summary: Revoga uma chave MCP
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: kid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Revogada
+        "404":
+          description: Chave não encontrada
+  /mcp:
+    post:
+      tags: [Eventos & Histórico]
+      summary: Servidor MCP com chave da sessão
+      description: >
+        Mesmo protocolo de `/api/mcp`, autenticado por uma chave MCP de sessão em
+        `Authorization: Bearer <chave>`. O agente só enxerga e usa a sessão da chave.
+        Também aceita a chave no caminho: `POST /mcp/{chave}`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Resposta JSON-RPC
+        "202":
+          description: Notificação aceita
+        "401":
+          description: Chave MCP ausente, inválida ou revogada
+  /api/mcp:
+    post:
+      tags: [Eventos & Histórico]
+      summary: Servidor MCP (Model Context Protocol) para agentes de IA
+      description: |
+        Endpoint MCP no transporte *Streamable HTTP*, sem estado: cada POST leva uma
+        mensagem JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, `ping`) e recebe a
+        resposta em JSON; notificações recebem 202. Exige a API Key (`Authorization: Bearer`,
+        `X-API-Key` ou `?apiKey=`); a chave de widget não libera. São 44 ferramentas (mensagens,
+        leitura de conversas, ligações, contatos, grupos, comunidades, limite de envio e
+        `api_request` para as demais rotas). Configure no cliente MCP só a URL e a chave.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jsonrpc: { type: string, example: "2.0" }
+                id: { oneOf: [{ type: integer }, { type: string }] }
+                method: { type: string, example: tools/call }
+                params: { type: object }
+            example:
+              jsonrpc: "2.0"
+              id: 1
+              method: tools/call
+              params: { name: send_text, arguments: { to: "5561999998888", text: "Olá!" } }
+      responses:
+        "200":
+          description: Resposta JSON-RPC
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: Notificação aceita (sem corpo)
+        "401":
+          description: API Key ausente ou inválida
   /api/events:
     get:
       tags: [Eventos & Histórico]
@@ -2328,9 +2461,13 @@ paths:
   /api/sessions/{sid}/blocklist:
     get:
       tags: [Contatos]
-      summary: Lista os JIDs bloqueados
+      summary: Lista os contatos bloqueados (telefone e LID)
+      description: |
+        Passe o `dhash` da resposta anterior em `?dhash=` para só receber a lista
+        quando ela mudou; sem mudança, a resposta é `{"changed": false}`.
       parameters:
         - { $ref: "#/components/parameters/Sid" }
+        - { name: dhash, in: query, required: false, schema: { type: string }, description: "dhash da última consulta" }
       responses:
         "200":
           description: OK
@@ -2338,7 +2475,19 @@ paths:
             application/json:
               schema:
                 type: object
-                properties: { blocked: { type: array, items: { type: string }, description: "JIDs bloqueados (podem vir como @lid)" } }
+                properties:
+                  changed: { type: boolean, description: "false quando o dhash informado ainda é o atual" }
+                  dhash: { type: string, description: "versão atual da lista" }
+                  blocked: { type: array, items: { type: string }, description: "um JID por bloqueado: telefone quando conhecido, senão @lid" }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        jid: { type: string }
+                        lid: { type: string, description: "JID @lid do bloqueado" }
+                        phone: { type: string, description: "telefone (só dígitos), quando conhecido" }
+                        active: { type: boolean }
 
   # ===================== Grupos =====================
   /api/sessions/{sid}/groups:

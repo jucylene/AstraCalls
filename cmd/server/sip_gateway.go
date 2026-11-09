@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+
+	"wacalls/internal/voip/core"
 )
 
 type SIPGateway struct {
@@ -313,7 +316,25 @@ func (gw *SIPGateway) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
 		_ = tx.Respond(ok200)
 		return
 	}
+	inb, isInbound := gw.inboundDialogs[sipCallID]
 	gw.mu.Unlock()
+
+	// re-INVITE de chamada recebida (WhatsApp -> ramal): o PBX renegocia mídia
+	// depois de atender (directmedia/canreinvite do Asterisk, session timer, hold).
+	// Antes caía no fluxo de chamada nova e, como o To do re-INVITE é quem ligou,
+	// o AstraCalls LIGAVA DE VOLTA para a origem; sem resposta ao re-INVITE o
+	// Asterisk derrubava tudo em ~30s.
+	if isInbound {
+		gw.inboundReInvite(inb, req, tx)
+		return
+	}
+	// INVITE com tag no To é de dentro de um diálogo que não conhecemos: nunca
+	// origina chamada nova.
+	if tag, _ := toHeader.Params.Get("tag"); tag != "" {
+		gw.log.Warn("SIP INVITE: re-INVITE de diálogo desconhecido", "sip_call_id", sipCallID)
+		gw.reply(tx, req, 481, "Call/Transaction Does Not Exist")
+		return
+	}
 
 	// Descobre a sessão dona do INVITE.
 	// Modelo 1: o softphone/PBX está registrado em nós (casa por sip_user).
@@ -680,6 +701,10 @@ func (gw *SIPGateway) challengeInvite(sess *Session, req *sip.Request, tx sip.Se
 // Com várias sessões no mesmo PBX, escolhe pelo ramal chamado (usuário do
 // Request-URI/To = usuário que registramos); sem como decidir, não escolhe — antes
 // pegava uma qualquer e a ligação podia cair no cliente errado.
+// sipLineHeader escolhe a sessão (pelo ramal com que ela registrou no PBX) quando
+// várias sessões estão registradas no mesmo PBX.
+const sipLineHeader = "X-AstraCalls-Ramal"
+
 func (gw *SIPGateway) sessionForExtInvite(req *sip.Request) *Session {
 	sourceIP := sourceIPOf(req.Source())
 	users := map[string]bool{}
@@ -688,6 +713,13 @@ func (gw *SIPGateway) sessionForExtInvite(req *sip.Request) *Session {
 	}
 	if to := req.To(); to != nil && to.Address.User != "" {
 		users[to.Address.User] = true
+	}
+	// Várias sessões no mesmo PBX: o Request-URI/To levam o número discado, então
+	// o PBX diz por qual linha sair no cabeçalho (Asterisk: PJSIP_HEADER(add,...)).
+	if h := req.GetHeader(sipLineHeader); h != nil {
+		if u := strings.TrimSpace(h.Value()); u != "" {
+			users[u] = true
+		}
 	}
 	gw.mu.RLock()
 	defer gw.mu.RUnlock()
@@ -716,7 +748,7 @@ func (gw *SIPGateway) sessionForExtInvite(req *sip.Request) *Session {
 		}
 	}
 	if match == nil {
-		gw.log.Warn("SIP INVITE: várias sessões no mesmo PBX e nenhuma com o ramal chamado", "source", sourceIP, "ramal", req.Recipient.User)
+		gw.log.Warn("SIP INVITE: várias sessões no mesmo PBX e nenhuma com o ramal chamado (use o cabeçalho "+sipLineHeader+")", "source", sourceIP, "ramal", req.Recipient.User)
 	}
 	return match
 }
@@ -830,6 +862,12 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 	if reg != nil {
 		targetURI = reg.contactURI
 		targetLabel = reg.sipUser
+		// O Asterisk registra com Contact "s@..." (chan_sip sem "/ramal" no register,
+		// PJSIP sem contact_user) e a chamada caía na entrada com DID "s", sem como
+		// separar troncos. Nesse caso o DID vira o número do WhatsApp da sessão.
+		if u := strings.TrimSpace(targetURI.User); (u == "" || u == "s") && sess.client.Store.ID != nil {
+			targetURI.User = sess.client.Store.ID.User
+		}
 	} else if cfg := sess.sipExtSnapshot(); cfg.Enabled && cfg.Host != "" && cfg.Dest != "" {
 		port := cfg.Port
 		if port <= 0 {
@@ -947,7 +985,11 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 		}
 		if err != nil {
 			gw.log.Info("inbound: SIP not answered", "err", err)
-			sess.terminateCallByID(callID)
+			reason := core.EndCallReasonDeclined
+			if errors.Is(err, context.DeadlineExceeded) {
+				reason = core.EndCallReasonTimeout
+			}
+			sess.declineRingingCall(callID, reason)
 			return
 		}
 
@@ -971,6 +1013,12 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 		if ac, ok := sess.reg.get(callID); ok {
 			if err := ac.cm.AcceptCall(context.Background(), callID); err != nil {
 				gw.log.Error("inbound: accept WhatsApp call failed", "err", err)
+			} else {
+				// Ramal atendeu: painel/widget param de tocar (antes ficavam em "tocando"
+				// e o "Atender" dava "call cannot be accepted in state active").
+				owner := "sip:" + targetLabel
+				gw.sessions.broker.setOwner(callID, owner)
+				gw.sessions.broker.emitIncomingClaimed(sess.id, callID, owner)
 			}
 		}
 		gw.log.Info("inbound: connected WhatsApp<->SIP", "sip_call_id", sipCallID, "wa_call_id", callID)
@@ -1008,6 +1056,41 @@ func (gw *SIPGateway) findSessionBySIPUser(sipUser string) *Session {
 		}
 	}
 	return nil
+}
+
+// inboundReInvite responde o re-INVITE de uma chamada WhatsApp -> SIP (somos o
+// UAC do diálogo): segue o RTP para o novo destino e confirma com o nosso SDP.
+func (gw *SIPGateway) inboundReInvite(inb *inboundDialog, req *sip.Request, tx sip.ServerTransaction) {
+	sipCallID := req.CallID().Value()
+	localPort, pt := 0, rtpPTPCMU
+	if s, ok := gw.sessions.Get(inb.sessionID); ok {
+		if ac, found := s.reg.get(inb.waCallID); found && ac.rtpBridge != nil {
+			if remoteRTP := extractRTPAddress(string(req.Body())); remoteRTP != "" {
+				if addr, err := net.ResolveUDPAddr("udp", remoteRTP); err == nil {
+					ac.rtpBridge.mu.Lock()
+					ac.rtpBridge.remote = addr
+					ac.rtpBridge.mu.Unlock()
+				}
+			}
+			localPort = ac.rtpBridge.LocalPort()
+			ac.rtpBridge.mu.Lock()
+			pt = ac.rtpBridge.pt
+			ac.rtpBridge.mu.Unlock()
+		}
+	}
+	if localPort == 0 {
+		gw.reply(tx, req, 481, "Call/Transaction Does Not Exist")
+		return
+	}
+	gw.log.Info("SIP INVITE: re-INVITE da chamada recebida", "sip_call_id", sipCallID, "wa_call_id", inb.waCallID)
+	ok200 := sip.NewResponseFromRequest(req, 200, "OK", []byte(buildSIPSDPAnswer(getLocalIP(), localPort, pt, 0)))
+	ok200.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	if inb.dialog != nil && inb.dialog.InviteRequest != nil {
+		if c := inb.dialog.InviteRequest.Contact(); c != nil {
+			ok200.AppendHeader(c)
+		}
+	}
+	_ = tx.Respond(ok200)
 }
 
 func (gw *SIPGateway) reply(tx sip.ServerTransaction, req *sip.Request, code int, reason string) {

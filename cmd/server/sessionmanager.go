@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"sync"
 
 	"go.mau.fi/whatsmeow"
@@ -79,30 +81,87 @@ func (m *SessionManager) accountIDForSession(sessionID string) int {
 		if c := s.getChatwoot(); c.valid() {
 			return c.AccountID
 		}
+		acct, _ := scopeFromName(sessionID, s.name)
+		return acct
 	}
 	return 0
 }
 
-func (m *SessionManager) sessionForChatwootAccount(accountID int) *Session {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, s := range m.sessions {
-		if c := s.getChatwoot(); c.valid() && c.AccountID == accountID {
-			return s
+var sessionNameScope = regexp.MustCompile(`^inbox(\d+)_acc(\d+)$`)
+
+// scopeFromName tira conta/caixa do padrão "inboxN_accM" com que o AstraChat cria
+// as sessões. Serve para a sessão nova, que ainda não tem Chatwoot configurado
+// enquanto pareia: sem isso o QR não chegaria ao SSE escopado da conta dona.
+func scopeFromName(id, name string) (acct, inbox int) {
+	for _, v := range []string{id, name} {
+		if m := sessionNameScope.FindStringSubmatch(v); m != nil {
+			inbox, _ = strconv.Atoi(m[1])
+			acct, _ = strconv.Atoi(m[2])
+			return
 		}
 	}
-	return nil
+	return 0, 0
 }
 
-// sessionForChatwootInbox: sessão amarrada à conta E à caixa (inbox) específica.
-// Usada para que o widget só apareça/ligue na caixa que tem WhatsApp conectado.
-func (m *SessionManager) sessionForChatwootInbox(accountID, inboxID int) *Session {
+// inboxIDForSession devolve a caixa (inbox) do Chatwoot ligada à sessão (0 = nenhuma).
+func (m *SessionManager) inboxIDForSession(sessionID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		if c := s.getChatwoot(); c.valid() {
+			return c.InboxID
+		}
+		_, inbox := scopeFromName(sessionID, s.name)
+		return inbox
+	}
+	return 0
+}
+
+// hostForSession devolve o host do Chatwoot ligado à sessão ("" = nenhum).
+func (m *SessionManager) hostForSession(sessionID string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		if c := s.getChatwoot(); c.valid() {
+			return chatwootHost(c.URL)
+		}
+	}
+	return ""
+}
+
+// chatwootScopeHost devolve o host da origem se ele for de um Chatwoot configurado
+// em alguma sessão; senão "" (escopo só pela conta, como antes). Duas instalações de
+// Chatwoot têm contas com o mesmo número (ex.: conta 1 em cada uma): sem o host, o
+// widget de uma enxergava as sessões/chamadas da outra.
+func (m *SessionManager) chatwootScopeHost(origin string) string {
+	host := chatwootHost(origin)
+	if host == "" {
+		return ""
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, s := range m.sessions {
-		if c := s.getChatwoot(); c.valid() && c.AccountID == accountID && c.InboxID == inboxID {
-			return s
+		if c := s.getChatwoot(); c.valid() && chatwootHost(c.URL) == host {
+			return host
 		}
+	}
+	return ""
+}
+
+// sessionForChatwoot acha a sessão ligada à conta (e à inbox, se inboxID > 0) do
+// Chatwoot em host ("" = qualquer Chatwoot).
+func (m *SessionManager) sessionForChatwoot(host string, accountID, inboxID int) *Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		c := s.getChatwoot()
+		if !c.valid() || c.AccountID != accountID || (inboxID > 0 && c.InboxID != inboxID) {
+			continue
+		}
+		if host != "" && chatwootHost(c.URL) != host {
+			continue
+		}
+		return s
 	}
 	return nil
 }
@@ -128,10 +187,6 @@ func (m *SessionManager) infos() []SessionInfo {
 		out = append(out, s.info())
 	}
 	return out
-}
-
-func (m *SessionManager) snapshotEvents() []any {
-	return []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
 }
 
 func (m *SessionManager) Restore(ctx context.Context) error {

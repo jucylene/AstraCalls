@@ -275,6 +275,7 @@ npm run dev      # Vite na :5173, faz proxy de /api → http://localhost:8080
 | `WACALLS_DEFAULT_TRANSPORT` | `auto` | Transporte de áudio do navegador: `auto` (WebRTC → fallback WS), `webrtc`, `websocket` |
 | `WACALLS_MAX_CALLS` | `8` | Equivalente a `-max-calls-per-session` |
 | `WACALLS_RING_TIMEOUT_SECONDS` | — | Expira chamada recebida que nunca é encerrada |
+| `WACALLS_UNIFIED_SESSION_MINUTES` | `5` | Intervalo mínimo entre os sinais "unified session" enviados ao conectar, como faz o WhatsApp Web (`0` desliga) |
 | `WACALLS_DEVICE_NAME` | `Windows` | Nome do aparelho em "Dispositivos conectados" (vale para pareamentos novos) |
 | `WACALLS_DEVICE_BROWSER` | `chrome` | Ícone/plataforma do aparelho: `chrome`, `edge`, `firefox`, `safari` ou `desktop` |
 | `WACALLS_RECORDING_DIR` | `$TMPDIR/wacalls-recordings` | Onde ficam os MP3s (retenção ~48h) |
@@ -367,6 +368,36 @@ Automatize o WhatsApp no **n8n sem escrever código**: o node oficial [`n8n-node
 - **Fácil de usar:** a sessão é escolhida numa lista (nome + número), o destino aceita número com ou sem o 9º dígito e a mídia vem por URL ou de um arquivo de etapa anterior.
 - **Pronto para responder:** o gatilho entrega `de`, `nome`, `texto` e `responderPara` prontos para usar no envio, e ignora as mensagens da própria conta (sem loop).
 - **Agentes de IA:** o node pode ser usado como ferramenta pelos agentes de IA do n8n.
+
+📘 **[Tutorial passo a passo](guias/n8n.md)**: instalar, criar a credencial, enviar a primeira mensagem e montar um robô que responde, com [fluxo pronto para importar](guias/n8n/responder-mensagem.json) e [10 fluxos de exemplo](guias/n8n.md#-10-fluxos-de-exemplo-prontos) (menu com botões, atendente de IA, enquete, disparo de ligações…).
+
+## 🤖 MCP para agentes de IA
+
+O AstraCalls traz um **servidor MCP** (Model Context Protocol) embutido: Claude, ChatGPT, Cursor,
+VS Code, n8n e outros agentes de IA usam o WhatsApp direto, sem instalar nada.
+
+**Chaves por sessão (recomendado):** no painel, botão **MCP** da sessão → **Nova chave**. A chave fica
+presa àquele número, pode ser **somente leitura** e é revogada a qualquer momento. Ela não permite
+parear, desconectar nem mexer em webhooks, Chatwoot, SIP ou proxy. O painel mostra, uma única vez, a
+URL e as configurações prontas para copiar. Pela API:
+`GET/POST /api/sessions/{sid}/mcp-keys` e `DELETE /api/sessions/{sid}/mcp-keys/{id}`.
+
+| Cliente | Como conectar |
+|---|---|
+| claude.ai, ChatGPT (conector personalizado) | URL `https://SEU-ASTRACALLS/mcp/<chave>` |
+| Claude Code | `claude mcp add --transport http astracalls https://SEU-ASTRACALLS/mcp --header "Authorization: Bearer <chave>"` |
+| Claude Desktop, Cursor, VS Code | `mcpServers` → `{"type":"http","url":"https://SEU-ASTRACALLS/mcp","headers":{"Authorization":"Bearer <chave>"}}` |
+| n8n | Ferramenta **MCP Client** do agente de IA, endereço `/mcp` e autenticação *Bearer* |
+
+**Acesso de administrador:** `https://SEU-ASTRACALLS/api/mcp` com a API Key da instância
+(`WACALLS_API_KEY`) enxerga todas as sessões; o agente escolhe o número por nome, telefone ou ID.
+
+**44 ferramentas:** enviar texto, mídia, documento, localização, contato, enquete, botões e lista;
+reagir, editar, apagar, marcar como lida e "digitando…"; **ler conversas e buscar mensagens**; ligar,
+encerrar, toque fantasma e disparo de ligações; contatos, grupos e comunidades; limite de conversas
+novas e restrição; e `api_request` para as demais rotas da sessão.
+
+> Quem tem a chave usa o número: trate-a como senha e revogue as que não usa mais.
 
 ---
 

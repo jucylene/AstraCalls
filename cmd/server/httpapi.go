@@ -253,6 +253,15 @@ func (s *server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 
+	// MCP (Model Context Protocol) para agentes de IA: ver mcp.go. /api/mcp usa a
+	// chave-mestra; /mcp e /mcp/{key} usam as chaves por sessão (mcpkeys.go).
+	mux.HandleFunc("/api/mcp", s.handleMCP)
+	mux.HandleFunc("/mcp", s.handleMCPScoped)
+	mux.HandleFunc("/mcp/{key}", s.handleMCPScoped)
+	mux.HandleFunc("GET /api/sessions/{sid}/mcp-keys", s.handleListMCPKeys)
+	mux.HandleFunc("POST /api/sessions/{sid}/mcp-keys", s.handleCreateMCPKey)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/mcp-keys/{kid}", s.handleDeleteMCPKey)
+
 	// Confiabilidade de entrega do webhook de sessão (circuit breaker + DLQ).
 	mux.HandleFunc("GET /api/sessions/{sid}/webhooks/status", s.handleWebhookStatus)
 	mux.HandleFunc("GET /api/sessions/{sid}/webhooks/dlq", s.handleWebhookDLQ)
@@ -270,9 +279,12 @@ func (s *server) routes() http.Handler {
 			mux.Handle("/", s.staticFileHandler())
 		}
 	}
+	s.apiMux = mux
 	var handler http.Handler = mux
 	if key := os.Getenv("WACALLS_API_KEY"); key != "" {
-		handler = withAuth(handler, key, os.Getenv("WACALLS_WIDGET_KEY"))
+		handler = withAuth(handler, key, os.Getenv("WACALLS_WIDGET_KEY"), func(sid string) (int, int) {
+			return s.sessions.accountIDForSession(sid), s.sessions.inboxIDForSession(sid)
+		})
 	}
 	return withCORS(handler)
 }
@@ -280,7 +292,7 @@ func (s *server) routes() http.Handler {
 func withCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-API-Key")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-API-Key, Authorization, Mcp-Session-Id, Mcp-Protocol-Version")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -290,7 +302,8 @@ func withCORS(h http.Handler) http.Handler {
 	})
 }
 
-// withAuth protege as rotas /api/* com uma API key (header X-API-Key ou ?apiKey=).
+// withAuth protege as rotas /api/* com uma API key (header X-API-Key,
+// Authorization: Bearer ou ?apiKey=).
 // Exceções: o webhook do Chatwoot (chamado externamente pelo próprio Chatwoot)
 // e os arquivos estáticos do painel (precisam carregar a tela de login).
 //
@@ -300,15 +313,15 @@ func withCORS(h http.Handler) http.Handler {
 // data-api-key/URL do EventSource, usar a de widget limita o estrago se ela
 // vazar: quem a pega NÃO consegue listar/apagar sessões, mandar mensagens nem
 // mexer na config do Chatwoot.
-func withAuth(h http.Handler, key, widgetKey string) http.Handler {
+//
+// sessionScope (opcional) devolve conta/caixa do Chatwoot de uma sessão: com ele, um
+// token de widget só opera chamadas das sessões da própria conta (e caixa, se fixada).
+func withAuth(h http.Handler, key, widgetKey string, sessionScope func(sid string) (acct, inbox int)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		guarded := strings.HasPrefix(p, "/api/") && !strings.HasSuffix(p, "/chatwoot/webhook")
 		if guarded {
-			got := r.Header.Get("X-API-Key")
-			if got == "" {
-				got = r.URL.Query().Get("apiKey")
-			}
+			got := requestAPIKey(r)
 			if got == key {
 				h.ServeHTTP(w, r) // chave-mestra: libera tudo
 				return
@@ -316,6 +329,11 @@ func withAuth(h http.Handler, key, widgetKey string) http.Handler {
 			// Superfície de widget: chave estática (por instância) OU token efêmero (por conta).
 			if widgetAllowed(r) {
 				if widgetKey != "" && got == widgetKey {
+					// sem conta o SSE viraria "painel admin" e receberia tudo (QR inclusive).
+					if p == "/api/events" && asInt(r.URL.Query().Get("accountId")) == 0 && accountFromClientID(clientID(r)) == 0 {
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_required"})
+						return
+					}
 					h.ServeHTTP(w, r)
 					return
 				}
@@ -324,6 +342,18 @@ func withAuth(h http.Handler, key, widgetKey string) http.Handler {
 					if p == "/api/events" && !widgetTokenAccountMatches(r, claims) {
 						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_scope_mismatch"})
 						return
+					}
+					if p == "/api/chatwoot/resolve" && asInt(r.URL.Query().Get("account_id")) != claims.AccountID {
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_scope_mismatch"})
+						return
+					}
+					// e só opera chamadas de sessões da própria conta/caixa.
+					if sid := sessionIDFromPath(p); sid != "" && sessionScope != nil {
+						acct, inbox := sessionScope(sid)
+						if acct != claims.AccountID || (claims.InboxID > 0 && inbox != claims.InboxID) {
+							writeJSON(w, http.StatusForbidden, map[string]string{"error": "session_scope_mismatch"})
+							return
+						}
 					}
 					h.ServeHTTP(w, r)
 					return
@@ -334,6 +364,53 @@ func withAuth(h http.Handler, key, widgetKey string) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// sessionIDFromPath devolve o {sid} de /api/sessions/{sid}/... ("" se não for rota de sessão).
+func sessionIDFromPath(p string) string {
+	rest, ok := strings.CutPrefix(p, "/api/sessions/")
+	if !ok {
+		return ""
+	}
+	sid, _, _ := strings.Cut(rest, "/")
+	return sid
+}
+
+// requestAPIKey extrai a chave da requisição (X-API-Key, Bearer ou ?apiKey=).
+func requestAPIKey(r *http.Request) string {
+	got := r.Header.Get("X-API-Key")
+	if got == "" {
+		got, _ = strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	if got == "" {
+		got = r.URL.Query().Get("apiKey")
+	}
+	return got
+}
+
+// eventInboxes lê as caixas (inbox) do Chatwoot que o assinante do SSE atende:
+// ?inboxIds=1,2 (ou ?inboxId=1). Um token de widget com caixa fixa SEMPRE fica
+// restrito a ela, mesmo que a query peça outras. nil = todas as caixas da conta.
+func eventInboxes(r *http.Request) map[int]bool {
+	if c, ok := parseWidgetToken(requestAPIKey(r)); ok && c.InboxID > 0 {
+		return map[int]bool{c.InboxID: true}
+	}
+	q := r.URL.Query()
+	raw := q.Get("inboxIds")
+	if raw == "" {
+		raw = q.Get("inboxId")
+	}
+	if raw == "" {
+		return nil
+	}
+	// lista sem nenhum id válido (ex.: "0", agente sem caixa) = não recebe nada.
+	out := map[int]bool{}
+	for _, p := range strings.Split(raw, ",") {
+		if id := asInt(strings.TrimSpace(p)); id > 0 {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 // widgetAllowed diz se a rota faz parte da superfície mínima do widget do
@@ -439,8 +516,16 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// diagnóstico: quem conectou no SSE e com qual conta (o widget deve passar a
 	// conta do Chatwoot; o painel, nenhuma). Ajuda a ver se a chamada não "entra"
 	// no Chatwoot por o widget não estar conectado ou estar em outra conta.
-	s.log.Info("sse connect", "clientId", cid, "accountId", acc, "origin", r.Header.Get("Origin"))
-	s.broker.serveSSE(w, r, cid, acc)
+	host := ""
+	if acc != 0 {
+		host = s.sessions.chatwootScopeHost(r.Header.Get("Origin"))
+	}
+	var inboxes map[int]bool
+	if acc != 0 {
+		inboxes = eventInboxes(r) // filtro por caixa só vale para widget de conta
+	}
+	s.log.Info("sse connect", "clientId", cid, "accountId", acc, "origin", r.Header.Get("Origin"), "cwHost", host, "inboxes", len(inboxes))
+	s.broker.serveSSE(w, r, cid, acc, host, inboxes)
 	s.log.Info("sse disconnect", "clientId", cid, "accountId", acc)
 }
 
