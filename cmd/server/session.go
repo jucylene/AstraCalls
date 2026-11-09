@@ -165,14 +165,33 @@ func (s *Session) selfSentOrigin(id string) (origin string, ok bool) {
 
 // sendAndMark envia uma mensagem, a registra como "enviada por nós" e devolve o
 // ID da mensagem do WhatsApp (usado p/ gravar o source_id no Chatwoot).
-// sendResolvingLID envia a mensagem e, no erro "no LID found" (número sem
+// sendResolvingLID envia a mensagem e, no ErrRecipientNotOnWhatsApp (número sem
 // mapeamento PN↔LID no store — ex.: 9º dígito BR), resolve o LID+PN canônicos via
 // IsOnWhatsApp, GRAVA o mapeamento e reenvia PELO PN (e por fim pelo @lid cru).
 // Usado por TODOS os envios (sendTo/API e sendAndMark/Chatwoot) para que o 9º
 // dígito não quebre nenhum caminho de envio.
+//
+// Em grupo, liga CheckPermissions: se o grupo só aceita mensagens de admins e a
+// conta não é admin, o whatsmeow recusa na hora (ErrNoPermissionInGroup) em vez
+// de mandar uma mensagem que o WhatsApp descarta.
 func (s *Session) sendResolvingLID(ctx context.Context, jid types.JID, msg *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	if jid.Server == types.GroupServer {
+		if len(extra) == 0 {
+			extra = []whatsmeow.SendRequestExtra{{}}
+		}
+		extra[0].CheckPermissions = true
+	}
 	jid = s.canonicalBRTarget(ctx, jid)
 	resp, err := s.client.SendMessage(ctx, jid, msg, extra...)
+	if errors.Is(err, whatsmeow.ErrNoPermissionInGroup) {
+		// o cache de grupo do whatsmeow só é atualizado por notificações; se o
+		// grupo mudou com a sessão offline (deixou de ser só de admins, conta
+		// promovida) ele está velho. Rebusca as informações (atualiza o cache)
+		// e tenta uma vez antes de recusar.
+		if _, gerr := s.client.GetGroupInfo(ctx, jid); gerr == nil {
+			resp, err = s.client.SendMessage(ctx, jid, msg, extra...)
+		}
+	}
 	if err != nil && isLIDResolveErr(err) && jid.Server == types.DefaultUserServer {
 		if lid, pn, ok := s.resolveCanonical(ctx, jid); ok {
 			s.client.StoreLIDPNMapping(ctx, lid, pn)
@@ -223,15 +242,21 @@ func (s *Session) canonicalBRTarget(ctx context.Context, jid types.JID) types.JI
 	return jid
 }
 
+// isPermanentSendErr indica erro de envio que repetir não resolve: número sem
+// WhatsApp ou grupo em que só administradores podem enviar.
+func isPermanentSendErr(err error) bool {
+	return errors.Is(err, whatsmeow.ErrRecipientNotOnWhatsApp) || errors.Is(err, whatsmeow.ErrNoPermissionInGroup)
+}
+
 // isLIDResolveErr indica que o whatsmeow não conseguiu resolver o LID do
 // destinatário (novo requisito do WhatsApp) — normalmente por o número (PN)
-// estar num formato que o servidor não reconhece.
+// estar num formato que o servidor não reconhece. O "sem LID no servidor" vem
+// tipado (ErrRecipientNotOnWhatsApp); a falha de leitura do store local, não.
 func isLIDResolveErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	e := err.Error()
-	return strings.Contains(e, "no LID found") || strings.Contains(e, "get LID for PN")
+	return errors.Is(err, whatsmeow.ErrRecipientNotOnWhatsApp) || strings.Contains(err.Error(), "get LID for PN")
 }
 
 type canonInfo struct {
@@ -341,6 +366,7 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 		auth:   AuthSnapshot{State: "connecting"},
 		reg:    newCallRegistry(),
 	}
+	configureClient(client)
 	client.AddEventHandler(s.handleEvent)
 	go s.runPresenceKeepalive()
 	go s.runCappingRefresh()
@@ -516,9 +542,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if !ok {
 			return
 		}
-		// diagnóstico (opt-in): confirma que o áudio do peer (WhatsApp) chega e se há ponte SIP.
+		// diagnóstico: conta sempre (resumo no fim da chamada); log por frame só em debug.
+		n := atomic.AddUint64(&ac.peerAudioN, 1)
 		if sipDebugEnabled {
-			n := atomic.AddUint64(&ac.peerAudioN, 1)
 			if n == 1 || n%500 == 0 {
 				s.log.Info("peer audio (WhatsApp->consumidor)", "call_id", callID, "frames", n,
 					"has_sip", ac.rtpBridge != nil, "has_ws", ac.wsBridge != nil, "has_webrtc", ac.bridge != nil, "samples", len(pcm16))
@@ -536,7 +562,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		// ponte WebSocket: envia PCM16 direto, sem Opus (menos CPU/latência).
 		if ws := ac.wsBridge; ws != nil {
-			_ = ws.WritePCM(pcm16)
+			if ws.WritePCM(pcm16) == nil {
+				atomic.AddUint64(&ac.toBrowserN, 1)
+			}
 			return
 		}
 		// ponte WebRTC (pion): o navegador espera Opus/RTP.
@@ -546,7 +574,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			if err != nil || len(opus) == 0 {
 				return
 			}
-			_ = ac.bridge.WriteOpus(opus, 60*time.Millisecond)
+			if ac.bridge.WriteOpus(opus, 60*time.Millisecond) == nil {
+				atomic.AddUint64(&ac.toBrowserN, 1)
+			}
+		} else if ac.rtpBridge == nil {
+			atomic.AddUint64(&ac.noBrowserN, 1)
 		}
 	}
 	cm.OnPeerVideo = func(au []byte) {
@@ -800,8 +832,12 @@ func (s *Session) handleEvent(rawEvt any) {
 			s.maybeMarkRead(ctx, evt)
 		}
 	case *events.HistorySync:
-		// conversas antigas que o WhatsApp envia ao parear -> importa pro Chatwoot
-		go s.importHistorySync(evt.Data)
+		// conversas antigas que o WhatsApp envia ao parear: grava no histórico (base
+		// das rotas de chats e das âncoras do import sob demanda) e importa pro Chatwoot
+		go func() {
+			s.storeHistorySync(evt.Data)
+			s.importHistorySync(evt.Data)
+		}()
 	case *events.GroupInfo:
 		// entrou/saiu/promoveu no grupo -> webhook + nota no Chatwoot
 		go s.handleGroupSystemEvent(evt)
@@ -1066,6 +1102,9 @@ func (s *Session) removeCall(callID string) {
 	if !ok {
 		return
 	}
+	s.log.Info("call media stats (navegador)", "call_id", callID,
+		"peer_frames", atomic.LoadUint64(&ac.peerAudioN), "to_browser", atomic.LoadUint64(&ac.toBrowserN),
+		"no_bridge", atomic.LoadUint64(&ac.noBrowserN), "webrtc", ac.bridge != nil, "ws", ac.wsBridge != nil)
 	s.finalizeRecording(ac)
 	ac.spies.closeAll()
 	if ac.bridge != nil {
@@ -1168,7 +1207,19 @@ func (s *Session) replaceClient(client *whatsmeow.Client) {
 	s.teardownAllCalls()
 	s.client.Disconnect()
 	s.client = client
+	configureClient(client)
 	client.AddEventHandler(s.handleEvent)
+}
+
+// unifiedSessionInterval é o intervalo mínimo entre envios do "unified_session"
+// ao conectar. O WhatsApp Web manda esse sinal a cada conexão (além do
+// pareamento e da presença available, que o whatsmeow já cobre); sem ele o
+// aparelho foge do padrão de um cliente oficial. 0 desliga o envio na conexão.
+var unifiedSessionInterval = time.Duration(envInt("WACALLS_UNIFIED_SESSION_MINUTES", 5)) * time.Minute
+
+// configureClient aplica as opções do whatsmeow comuns a todo client de sessão.
+func configureClient(client *whatsmeow.Client) {
+	client.UnifiedSessionInterval = unifiedSessionInterval
 }
 
 func (s *Session) shutdown() {
@@ -1226,11 +1277,23 @@ const (
 	sipInboundAuto      = "auto"      // agent se ligaram p/ o próprio ramal; senão originate
 )
 
-// sipAgentOpts é a config do modo agente (persistida como JSON em sip_ext_opts).
+// sipAgentOpts são as opções extras do modelo 2 (persistidas como JSON em
+// sip_ext_opts): modo agente e o usuário de autenticação.
 type sipAgentOpts struct {
+	// AuthUser é o usuário do digest quando difere do ramal (3CX: "Authentication
+	// ID"; alguns provedores: "auth username"). Vazio = usa o próprio ramal.
+	AuthUser    string `json:"authUser,omitempty"`
 	InboundMode string `json:"inboundMode,omitempty"`
 	AutoAnswer  bool   `json:"agentAutoAnswer,omitempty"`
 	RingTimeout int    `json:"agentRingTimeoutSeconds,omitempty"`
+}
+
+// authUser é o usuário do digest: o Auth ID, se informado, senão o ramal.
+func (c sipExtConfig) authUser() string {
+	if u := strings.TrimSpace(c.Agent.AuthUser); u != "" {
+		return u
+	}
+	return c.User
 }
 
 func (o sipAgentOpts) mode() string {
@@ -1297,6 +1360,23 @@ func (s *Session) terminateCallByID(callID string) {
 		return
 	}
 	_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+}
+
+// declineRingingCall encerra no WhatsApp uma chamada que o ramal SIP recusou
+// (486/603) ou não atendeu. Ainda tocando, precisa de <reject>: o <terminate> do
+// EndCall é ignorado antes do aceite e o celular de quem ligou seguia chamando.
+func (s *Session) declineRingingCall(callID string, reason core.EndCallReason) {
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		return
+	}
+	if ac.answered.Load() {
+		_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+		return
+	}
+	_ = ac.cm.RejectCall(s.mgr.appCtx, callID, reason)
+	s.removeCall(callID)
+	s.mgr.broker.endCall(callID, string(reason))
 }
 
 func (s *Session) setRTPBridge(callID string, b *SIPRTPBridge) {

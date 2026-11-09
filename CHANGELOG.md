@@ -2,6 +2,109 @@
 
 Todas as mudanças relevantes do AstraCalls.
 
+## v1.1.6 — 2026-11-05
+
+Aproveita os recursos novos do whatsmeow de 02/11: o vídeo começa a tocar antes de baixar
+inteiro, e os erros de envio ficam claros (número sem WhatsApp, grupo só de admins). Traz
+também a lista de bloqueados completa, conversas por LID com telefone e nome, histórico do
+pareamento gravado e o SSE separado por conta e caixa. Inclui o **tutorial do n8n** com 10
+fluxos prontos.
+
+### 📤 Envio
+
+- **Vídeo com streaming:** vídeo, PTV, status e envio pelo Chatwoot levam o *streaming
+  sidecar*, então o vídeo começa a tocar enquanto baixa. Também passam a levar o
+  `mediaKeyTimestamp`, cuja falta já fazia o áudio sumir no iPhone.
+- **Número sem WhatsApp:** responde **422** com `code: not_on_whatsapp` (antes era um 500
+  genérico).
+- **Grupo só de admins:** responde **403** com `code: no_permission_in_group` sem mandar a
+  mensagem. Antes de recusar, o grupo é consultado de novo, porque a informação guardada
+  pode estar velha.
+- **Disparos** não repetem 3 vezes um erro permanente, e o Chatwoot mostra o motivo em texto
+  amigável.
+- **Sessão unificada** a cada conexão, como faz o WhatsApp Web
+  (`WACALLS_UNIFIED_SESSION_MINUTES`, padrão 5; `0` desliga).
+
+### 🚫 Bloqueados
+
+- `GET /blocklist` devolve `items` (`jid`, `lid`, `phone`, `active`) e o `dhash`. Com
+  `?dhash=` só devolve a lista quando ela mudou.
+- Bloquear/desbloquear corrige o 9º dígito do número antes de enviar ao WhatsApp, como já é
+  feito no envio.
+
+### 💬 Conversas e histórico
+
+- **Conversa por LID** sai com o telefone e o nome do contato: `/chats` junta as conversas do
+  mesmo contato, e `/chats/{jid}/messages` busca pelo telefone e pelo LID. Sem `limit`,
+  `/chats` devolve até 500 conversas (antes 100).
+- **Histórico do pareamento gravado:** as conversas que o WhatsApp manda ao parear (e no
+  import sob demanda) agora ficam no histórico. Antes só iam para o Chatwoot.
+
+### 🔒 Eventos (SSE) por conta e caixa
+
+- Chamadas (`call-list`, `call-status`, `call-ended`) e a lista de sessões chegam só para a
+  conta e a caixa donas. Antes, widgets de outras contas viam números e sessões alheias.
+- QR e estado do pareamento vão para o painel e para a conta/caixa da sessão.
+- Filtro por caixa: `?inboxIds=1,2` em `/api/events`. O token de widget com caixa fixa só
+  opera chamadas da própria conta/caixa.
+
+### 📚 n8n
+
+- **Tutorial passo a passo** em [`guias/n8n.md`](guias/n8n.md), com **10 fluxos de exemplo**
+  prontos para importar: fora do horário, menu com botões, agendamento, atendente de IA,
+  enquete, boas-vindas no grupo, disparo de ligações, validar lista, lembrete diário e
+  alerta de desconexão.
+
+## v1.1.5 — 2026-11-03
+
+Versão **urgente de conexão**: desde 02/11 o WhatsApp recusa clientes com versão antiga
+(`Client outdated (405)`) e a sessão não volta depois de um reinício ou queda. Esta versão
+atualiza o protocolo e evita a desconexão. **Atualize antes de reiniciar o servidor.** Traz
+também o **servidor MCP** para agentes de IA e várias correções da telefonia SIP com PABX
+(Asterisk/3CX).
+
+### 🔌 Conexão
+
+- **whatsmeow de 02/11/2026** (protocolo `2.3000.1052556849`): corrige o
+  `Client outdated (405)`. As sessões reconectam sem novo QR code.
+- Lista de bloqueados (`GET /blocklist`) adaptada ao novo formato do WhatsApp (LID + telefone);
+  devolve o telefone quando disponível.
+
+### 🤖 MCP — agentes de IA
+
+- **Servidor MCP embutido** (`/api/mcp`, Streamable HTTP) com 44 ferramentas: enviar
+  mensagens, ler e buscar conversas, ligar, contatos, grupos, comunidades, limite de
+  envio/restrição e `api_request`. Conecta Claude, ChatGPT, Cursor, n8n e outros.
+- **Chaves MCP por sessão** (até 20), criadas pelo botão **MCP** do painel ou por
+  `/api/sessions/{sid}/mcp-keys`: o agente enxerga só aquele número, sem acesso a parear,
+  desconectar, webhooks, Chatwoot ou SIP. Opção **somente leitura**. A chave aparece uma
+  única vez e pode ser revogada; conecta em `/mcp` (Bearer) ou `/mcp/{chave}`.
+- A API key também é aceita em `Authorization: Bearer`.
+
+### ☎️ Telefonia SIP
+
+- **Auth ID (3CX):** campo opcional "Usuário de autenticação" no registro em PABX externo,
+  separado do ramal (`authUser` em `/sip-ext`).
+- **Várias sessões no mesmo PABX:** o cabeçalho `X-AstraCalls-Ramal` no INVITE escolhe por
+  qual número de WhatsApp a ligação sai (no Asterisk, `PJSIP_HEADER(add,...)` no `Dial`).
+- **Recusa no ramal encerra no WhatsApp:** 486/603 do ramal agora recusa a chamada no
+  WhatsApp; antes o ramal parava de tocar e o celular de quem ligou seguia chamando.
+- **Liga de volta e cai em ~30 s:** o re-INVITE do PABX na chamada recebida era tratado como
+  ligação nova, discava para quem ligou e derrubava a chamada.
+- **Painel e widget param de tocar** quando o ramal atende (antes ficavam em "tocando" e o
+  Atender dava `call cannot be accepted in state active`).
+- **DID no Asterisk:** com o registro em Contact `s@host`, a ligação do WhatsApp passa a
+  chegar com o número da sessão como DID, permitindo separar as linhas no dialplan.
+
+### 🐞 Correções
+
+- **Áudio mudo do contato:** quando o aceite da chamada trazia outra chave, a chave de
+  recepção era sobrescrita e o áudio de quem ligou virava silêncio. Agora o fim de cada
+  chamada registra um resumo de mídia (pacotes, erros SRTP, nível do áudio) para diagnóstico.
+- **Chatwoot com mesma conta em instalações diferentes:** widget e botão de ligar não se
+  misturam mais entre dois Chatwoot com o mesmo número de conta.
+- Painel: a tela da chave MCP não estoura a largura do modal.
+
 ## v1.1.4 — 2026-10-24
 
 Versão de **segurança**: atualiza o Go, o gateway SIP e as bibliotecas de rede para fechar

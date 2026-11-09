@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -14,6 +15,7 @@ type server struct {
 	log       *slog.Logger
 	staticDir string
 	sipGW     *SIPGateway
+	apiMux    *http.ServeMux // usado pelo MCP para despachar as ferramentas em processo
 }
 
 // newServer monta o provedor de banco (Postgres, 1 banco por sessão no estilo
@@ -40,8 +42,10 @@ func newServer(ctx context.Context, pgURL, pgNamespace, staticDir string, maxCal
 
 	broker := NewBroker()
 	mgr := newSessionManager(ctx, provider, broker, store, waLogger, log, maxCalls)
-	broker.SnapshotFn = mgr.snapshotEvents
+	broker.SessionsFn = mgr.infos
 	broker.AccountForSession = mgr.accountIDForSession
+	broker.HostForSession = mgr.hostForSession
+	broker.InboxForSession = mgr.inboxIDForSession
 
 	// Gateway SIP: o PBX/softphone do cliente se registra aqui (modelo Wavoip).
 	// Endereço configurável por WACALLS_SIP_ADDR (padrão 0.0.0.0:5060).
